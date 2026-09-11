@@ -2596,28 +2596,43 @@ def get_learning_curve(spec, X, y, train_sizes=train_sizes_pct, cv=lc_cv):
             return None
 
     # Keras fallback: manual per-size, per-fold refit via spec.refit_on()
-    rng = np.random.RandomState(SEED)
     min_train_len = min(len(tr) for tr, _ in cv.split(X, y))
     sizes = np.unique((np.asarray(train_sizes) * min_train_len).astype(int))
     sizes = sizes[sizes >= LC_MIN_TRAIN]
     if len(sizes) == 0:
         return None
 
-    tr_mean, tr_std, va_mean, va_std = [], [], [], []
-    for size in sizes:
-        tr_s, va_s = [], []
-        for tr_idx, va_idx in cv.split(X, y):
-            # STRATIFIED subsample, not a plain rng.choice: an unstratified
-            # slice of an imbalanced training set can contain a single class,
-            # which makes AUC undefined and the curve jagged for the wrong
-            # reason.
-            sub, _ = train_test_split(tr_idx, train_size=int(size), random_state=SEED,
-                                      stratify=y[tr_idx])
-            proba_fn = spec.refit_on(X[sub], y[sub])
-            tr_s.append(primary_score(y[sub], proba_fn(X[sub])))
-            va_s.append(primary_score(y[va_idx], proba_fn(X[va_idx])))
-        tr_mean.append(np.nanmean(tr_s)); tr_std.append(np.nanstd(tr_s))
-        va_mean.append(np.nanmean(va_s)); va_std.append(np.nanstd(va_s))
+    try:
+        tr_mean, tr_std, va_mean, va_std = [], [], [], []
+        for size in sizes:
+            tr_s, va_s = [], []
+            for tr_idx, va_idx in cv.split(X, y):
+                if size >= len(tr_idx):
+                    # The last train_sizes entry is 1.0 of the SMALLEST fold, so
+                    # on every larger fold it is a genuine subsample — but on the
+                    # smallest one it equals the whole fold, and train_test_split
+                    # rejects train_size == n_samples. Use the fold as it is.
+                    sub = tr_idx
+                else:
+                    # STRATIFIED subsample, not a plain random choice: an
+                    # unstratified slice of an imbalanced training set can
+                    # contain a single class, which makes AUC undefined and the
+                    # curve jagged for the wrong reason.
+                    sub, _ = train_test_split(tr_idx, train_size=int(size),
+                                              random_state=SEED, stratify=y[tr_idx])
+                proba_fn = spec.refit_on(X[sub], y[sub])
+                tr_s.append(primary_score(y[sub], proba_fn(X[sub])))
+                va_s.append(primary_score(y[va_idx], proba_fn(X[va_idx])))
+            tr_mean.append(np.nanmean(tr_s)); tr_std.append(np.nanstd(tr_s))
+            va_mean.append(np.nanmean(va_s)); va_std.append(np.nanstd(va_s))
+    except Exception as exc:
+        # Fail soft, exactly like the sklearn branch above: a learning curve is
+        # a diagnostic, and losing one model's curve must not abort the
+        # evaluation of the other nineteen.
+        print(f"  learning curve unavailable for {spec.name}: "
+              f"{type(exc).__name__}: {exc}")
+        return None
+
     return sizes, np.array(tr_mean), np.array(tr_std), np.array(va_mean), np.array(va_std)
 
 
