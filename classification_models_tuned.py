@@ -3893,9 +3893,17 @@ for spec in models:
             values = explainer(X_shap).values
             base = float(np.mean(spec.predict_proba(X_bg)[:, SHAP_CLASS]))
 
+        sel = _select_class(values, SHAP_CLASS)
         explanations.append(shap.Explanation(
-            values        = _select_class(values, SHAP_CLASS),
-            base_values   = base,
+            values        = sel,
+            # ONE BASE VALUE PER ROW, as an array — not a bare Python float.
+            # shap's Explanation arithmetic (exp.abs.mean(0), used by the bar
+            # plot) reads self.base_values.shape, so a scalar float raises
+            # AttributeError deep inside the plotting call. A numpy scalar
+            # happens to survive because it has .shape == (), but the per-row
+            # array is what shap actually expects and it keeps the base value
+            # aligned when rows are sliced (e.g. the waterfall plot below).
+            base_values   = np.full(len(sel), base, dtype=np.float64),
             data          = X_shap,
             feature_names = feature_names))
         explained_specs.append(spec)
@@ -3906,13 +3914,24 @@ SHAP_RESULTS = dict(zip((s.name for s in explained_specs), explanations))
 
 
 def _shap_figure(plot_fn, explanation, title, filename):
-    plt.figure()
-    plot_fn(explanation, show=False)
-    plt.title(title, fontsize=13, fontweight='bold', color=INK)
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
-    plt.show()
-    plt.close()
+    """
+    Render one SHAP figure, failing soft.
+
+    shap's plotting API moves between releases more than any other dependency
+    in this file, and these plots are diagnostics — losing one must not abort
+    the run, least of all in Part 7 after every model has already been tuned.
+    """
+    try:
+        plt.figure()
+        plot_fn(explanation, show=False)
+        plt.title(title, fontsize=13, fontweight='bold', color=INK)
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.show()
+    except Exception as exc:
+        print(f"  SHAP plot skipped ({filename}): {type(exc).__name__}: {exc}")
+    finally:
+        plt.close()
 
 
 # ── SUMMARY BAR PLOTS ─────────────────────────────────────────────────────────
