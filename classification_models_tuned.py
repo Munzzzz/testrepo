@@ -2175,9 +2175,30 @@ def _meta_features(proba_tensor):
     return np.concatenate([proba_tensor[j] for j in range(M)], axis=1)
 
 
+#  CLASS WEIGHTING OF THE META-LEARNER — a knob worth knowing about.
+#  The base models each tune their own class_weight, but the meta-learner does
+#  not inherit any of that, and on an imbalanced target an unweighted logistic
+#  stack will happily learn an intercept that puts EVERY row below 0.5. The
+#  result is the failure this file is built to catch: an excellent ROC-AUC
+#  (the ranking is fine) next to F1 = 0 and balanced accuracy = 0.50 (the
+#  argmax decision never fires for the minority class). If you see that
+#  combination in the summary table for a stack, this is why.
+#
+#  It is left at None by default because the fix should be deliberate, and
+#  there are two different fixes depending on what you want:
+#    * 'balanced' here — re-weights the meta-learner so its 0.5 cutoff lands
+#      somewhere useful. Cheap, but it distorts the probabilities, so log-loss,
+#      Brier and the calibration curves all get worse.
+#    * leave None and move the THRESHOLD instead (Section 8E). This keeps the
+#      probabilities calibrated and treats the operating point as the separate
+#      decision it actually is. Usually the better answer.
+STACK_META_CLASS_WEIGHT = None      # or 'balanced'
+
+
 def _make_meta():
     return LogisticRegressionCV(
         Cs=np.logspace(-3, 3, 7), cv=ENSEMBLE_CV, scoring=SCORING,
+        class_weight=STACK_META_CLASS_WEIGHT,
         max_iter=5000, random_state=SEED, n_jobs=-1)
 
 
