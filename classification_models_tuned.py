@@ -2607,11 +2607,17 @@ def get_learning_curve(spec, X, y, train_sizes=train_sizes_pct, cv=lc_cv):
         for size in sizes:
             tr_s, va_s = [], []
             for tr_idx, va_idx in cv.split(X, y):
-                if size >= len(tr_idx):
-                    # The last train_sizes entry is 1.0 of the SMALLEST fold, so
-                    # on every larger fold it is a genuine subsample — but on the
-                    # smallest one it equals the whole fold, and train_test_split
-                    # rejects train_size == n_samples. Use the fold as it is.
+                if len(tr_idx) - size < N_CLASSES:
+                    # Two ways the largest train_sizes entry breaks a stratified
+                    # subsample, both hit in practice:
+                    #   size == len(tr_idx)      -> train_test_split rejects
+                    #                               train_size == n_samples;
+                    #   len(tr_idx) - size < K   -> the leftover is too small to
+                    #                               hold one row per class, and
+                    #                               stratify raises.
+                    # Both mean "this is effectively the whole fold", so use it
+                    # as-is. The plotted x value can then understate the rows
+                    # actually used by up to K-1, on the smallest fold only.
                     sub = tr_idx
                 else:
                     # STRATIFIED subsample, not a plain random choice: an
