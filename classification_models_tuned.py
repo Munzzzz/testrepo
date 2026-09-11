@@ -1935,15 +1935,38 @@ knn = ModelSpec("KNN", knn_search, knn_refit, search_factory=make_knn_search)
 #  REGRESSION -> CLASSIFICATION:
 #    * `epsilon` (the width of SVR's insensitive tube) has no meaning here and
 #      is gone; `class_weight` takes its place in the space.
-#    * probability=True is REQUIRED, because this whole pipeline is built on
-#      predict_proba. It is not free: sklearn fits an internal 5-fold Platt
-#      scaling on top of the SVM, so every SVC fit is really six, and this is
-#      the slowest model in the file. It is also why labels come from argmax of
-#      the calibrated probabilities here rather than from SVC.predict(), which
-#      uses the uncalibrated decision function and can disagree near the
-#      boundary.
+#    * calibrated probabilities are REQUIRED, because this whole pipeline is
+#      built on predict_proba. They are not free: a 5-fold calibration is fitted
+#      on top of the SVM, so every SVC fit is really six, and this is the
+#      slowest model in the file. It is also why labels come from argmax of the
+#      calibrated probabilities here rather than from SVC.predict(), which uses
+#      the uncalibrated decision function and can disagree near the boundary.
+#      See make_probabilistic_svc() below for how this is obtained across
+#      sklearn versions.
 # =============================================================================
 from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+import sklearn as _sklearn
+
+#  HOW THE PROBABILITIES ARE OBTAINED, across sklearn versions.
+#  SVC(probability=True) was deprecated in scikit-learn 1.9 and is scheduled
+#  for removal in 1.11, with CalibratedClassifierCV(SVC(), ensemble=False) as
+#  the named replacement. The two do the same thing — fit the SVM, then fit a
+#  calibrator on cross-validated decision values — so this picks whichever the
+#  installed version supports rather than emitting a deprecation warning on new
+#  sklearn or crashing on old. Either way the cost is the same: one SVC fit per
+#  calibration fold, which is what makes this the slowest model in the file.
+_SKLEARN_VERSION = tuple(int(p) for p in _sklearn.__version__.split(".")[:2])
+USE_CALIBRATED_SVC = _SKLEARN_VERSION >= (1, 9)
+
+
+def make_probabilistic_svc(**params):
+    """An SVC that exposes a usable predict_proba, on any sklearn version."""
+    base = SVC(cache_size=1000, random_state=SEED, **params)
+    if USE_CALIBRATED_SVC:
+        return CalibratedClassifierCV(base, ensemble=False, cv=5)
+    base.set_params(probability=True)
+    return base
 
 
 def svc_search(X, y):
@@ -1962,8 +1985,7 @@ def svc_search(X, y):
             params["coef0"] = trial.suggest_float("coef0", -1.0, 1.0)
 
         pipe = Pipeline([("scaler", SCALER_CLS()),
-                         ("model", SVC(probability=True, cache_size=1000,
-                                       random_state=SEED, **params))])
+                         ("model", make_probabilistic_svc(**params))])
         s = cross_val_score(pipe, X, y, cv=inner_cv, scoring=SCORING, n_jobs=-1)
         return float(-s.mean())
 
@@ -1974,8 +1996,7 @@ def svc_search(X, y):
 
 def svc_refit(X, y, params):
     m = Pipeline([("scaler", SCALER_CLS()),
-                  ("model", SVC(probability=True, cache_size=1000,
-                                random_state=SEED, **params))])
+                  ("model", make_probabilistic_svc(**params))])
     m.fit(X, y)
     return m, m.predict_proba
 
