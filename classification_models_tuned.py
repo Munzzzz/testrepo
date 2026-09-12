@@ -144,8 +144,82 @@ outer_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)   # nest
 #  (binary and multiclass need different sklearn scorer names).
 PRIMARY_METRIC = "ROC_AUC"
 SCORING = None          # set by resolve_scoring() in Section A
-N_ITER_RANDOM = 60      # RandomizedSearchCV draws
-N_TRIALS = {"mlp": 40, "xgb": 80, "lgbm": 80, "svc": 60, "cnn_lstm": 30, "seq_logit": 25}
+
+
+# =============================================================================
+#  TUNING BUDGET — READ THIS BEFORE THE FIRST RUN
+# =============================================================================
+#  The dominant cost in this file is the three Keras models, and it is not
+#  obvious from the code how large it gets. One Optuna trial trains a network
+#  once PER CV FOLD, so the search alone is n_trials x n_folds networks, and
+#  the neural models are then refit again by the K-fold sweep (Part 5), the
+#  learning curves (Part 6), the bias-variance bootstrap (Part 6) and — most
+#  expensively — by every ensemble that contains them (Section 4B), which
+#  refits its members for each out-of-fold pass.
+#
+#  At the "full" budget that totals roughly 1,000 network fits. On a GPU that
+#  is an afternoon; on a notebook CPU it is 2-8 hours, and the first symptom is
+#  the search appearing to hang on "Shallow MLP" for 40 minutes. It is not
+#  hung — it is doing 200 trainings.
+#
+#  So pick a profile. "balanced" is the default and is what most tabular
+#  problems want; "fast" is for a first pass or a CPU-only machine; "full" is
+#  the original budget and should be reserved for a final, GPU-backed run.
+#
+#  If you do not need the neural models at all — and on small tabular data the
+#  boosted trees usually win — the single biggest saving is to drop them from
+#  the roster in Section 4:
+#      models = [rf, svc, xgboost_model, lgbm, ada, knn]
+#  That removes every Keras fit in the file and typically takes the whole run
+#  from hours to minutes.
+# =============================================================================
+TUNING_PROFILE = "balanced"     # "fast" | "balanced" | "full"
+
+_PROFILES = {
+    #                     trials per Optuna model              random  epochs pat folds  timeout
+    "fast":     (dict(mlp=8,  xgb=25, lgbm=25, svc=15, cnn_lstm=5,  seq_logit=8),  20,  120,  8, 3,  300),
+    "balanced": (dict(mlp=20, xgb=50, lgbm=50, svc=30, cnn_lstm=12, seq_logit=15), 40,  200, 15, 3,  900),
+    "full":     (dict(mlp=40, xgb=80, lgbm=80, svc=60, cnn_lstm=30, seq_logit=25), 60,  300, 25, 5, None),
+}
+if TUNING_PROFILE not in _PROFILES:
+    raise ValueError(f"TUNING_PROFILE must be one of {list(_PROFILES)}")
+(N_TRIALS, N_ITER_RANDOM, KERAS_EPOCHS, KERAS_PATIENCE,
+ KERAS_CV_SPLITS, STUDY_TIMEOUT) = _PROFILES[TUNING_PROFILE]
+
+#  The searches are not the only repeated-refit loops. The K-fold stability
+#  sweep (Part 5), the learning curves and the bias-variance bootstrap (Part 6)
+#  each refit every model many times over, so they scale with the profile too.
+_DOWNSTREAM = {
+    "fast":     dict(sweep_max_k=4,  lc_sizes=3,  n_bootstrap=5),
+    "balanced": dict(sweep_max_k=7,  lc_sizes=5,  n_bootstrap=10),
+    "full":     dict(sweep_max_k=11, lc_sizes=10, n_bootstrap=20),
+}
+SWEEP_MAX_K  = _DOWNSTREAM[TUNING_PROFILE]["sweep_max_k"]
+LC_SIZES     = _DOWNSTREAM[TUNING_PROFILE]["lc_sizes"]
+N_BOOTSTRAP  = _DOWNSTREAM[TUNING_PROFILE]["n_bootstrap"]
+
+print(f"Tuning profile: {TUNING_PROFILE}  |  Optuna trials: {N_TRIALS}  |  "
+      f"random-search draws: {N_ITER_RANDOM}")
+print(f"  Keras: {KERAS_EPOCHS} epochs, patience {KERAS_PATIENCE}, "
+      f"{KERAS_CV_SPLITS} search folds  |  per-model search budget: "
+      f"{'unlimited' if STUDY_TIMEOUT is None else str(STUDY_TIMEOUT) + 's'}")
+
+#  The Keras searches get their own, usually smaller, fold count. Each fold
+#  costs a full network training, so 5 -> 3 folds is a 40% saving on the single
+#  most expensive part of the run. The tuning signal barely changes: fold count
+#  affects the variance of the CV estimate, and the search only needs to RANK
+#  configurations, not measure them precisely. The final evaluation in Part 6
+#  is unaffected — it uses the held-out test set either way.
+keras_cv = StratifiedKFold(n_splits=KERAS_CV_SPLITS, shuffle=True, random_state=SEED)
+
+#  STUDY_TIMEOUT is a hard wall-clock bound, in seconds, on EACH model's
+#  search. Optuna finishes the trial it is running and then stops, keeping the
+#  best parameters found so far, so a slow model degrades into a shorter search
+#  instead of stalling the notebook indefinitely. None = no limit.
+#
+#  A search that stops on the timeout rather than on n_trials is reported as
+#  such below, so an under-searched model is never mistaken for a fully tuned
+#  one in the results table.
 
 RESULTS = {}   # name -> dict of test metrics, filled in by report()
 
@@ -1634,8 +1708,23 @@ def balanced_sample_weight(y_enc, use_weights=True):
     return np.array([lookup[v] for v in y_enc], dtype=np.float32)
 
 
-def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=300, cv=None, to3d=False,
-                  trial=None, patience=25, balanced=False):
+def keras_predict(model, X):
+    """
+    Probabilities from a Keras model, the fast way for small inputs.
+
+    model.predict() sets up a batched prediction loop and its own tf.function
+    on every call. Across the hundreds of calls this file makes, that overhead
+    dominates the actual arithmetic on tabular-sized data, so small arrays go
+    through the model directly and only large ones pay for the loop.
+    """
+    X = np.asarray(X, dtype=np.float32)
+    if len(X) <= 4096:
+        return np.asarray(model(X, training=False))
+    return model.predict(X, verbose=0)
+
+
+def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=None, cv=None, to3d=False,
+                  trial=None, patience=None, balanced=False):
     """
     Manual stratified K-fold for Keras: refits the feature scaler inside every
     fold (no leakage), early-stops each fold on its own validation split, and
@@ -1644,7 +1733,9 @@ def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=300, cv=None, to3d=False
     Returns a value to MINIMIZE: -PRIMARY_METRIC, so every Keras model is tuned
     on exactly the same objective as the sklearn and boosted models.
     """
-    cv = cv or inner_cv
+    cv = cv or keras_cv
+    epochs = KERAS_EPOCHS if epochs is None else epochs
+    patience = KERAS_PATIENCE if patience is None else patience
     fold_scores = []
     for k, (tr, va) in enumerate(cv.split(X, y)):
         Xtr, Xva = X[tr], X[va]
@@ -1677,7 +1768,7 @@ def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=300, cv=None, to3d=False
                   epochs=epochs, batch_size=batch_size, verbose=0,
                   callbacks=[es], sample_weight=sw_tr)
 
-        proba = keras_probabilities(model.predict(Xva_s, verbose=0))
+        proba = keras_probabilities(keras_predict(model, Xva_s))
         fold_scores.append(primary_score(yva, proba))
 
         if trial is not None:                      # Optuna pruning hook
@@ -1688,8 +1779,8 @@ def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=300, cv=None, to3d=False
     return float(-np.nanmean(fold_scores))
 
 
-def keras_fit(build_fn, Xtr, ytr, batch_size, epochs=400, to3d=False,
-              val_frac=0.15, patience=30, balanced=False):
+def keras_fit(build_fn, Xtr, ytr, batch_size, epochs=None, to3d=False,
+              val_frac=0.15, patience=None, balanced=False):
     """
     Fit the tuned architecture on (Xtr, ytr). Returns (model, proba_fn) where
     proba_fn carries the fitted feature scaler so it can be called on ANY
@@ -1699,6 +1790,11 @@ def keras_fit(build_fn, Xtr, ytr, batch_size, epochs=400, to3d=False,
     on an imbalanced target can end up with no minority rows at all, which
     makes val_loss a majority-class-only quantity and early stopping blind.
     """
+    # The final fit gets a little more headroom than a search fold: it happens
+    # once per model, and this is the network that is actually scored.
+    epochs = int(KERAS_EPOCHS * 1.3) if epochs is None else epochs
+    patience = KERAS_PATIENCE + 5 if patience is None else patience
+
     n_val = max(N_CLASSES, int(len(Xtr) * val_frac))
     idx = np.arange(len(Xtr))
     tr_i, va_i = train_test_split(idx, test_size=n_val, random_state=SEED, stratify=ytr)
@@ -1732,7 +1828,7 @@ def keras_fit(build_fn, Xtr, ytr, batch_size, epochs=400, to3d=False,
         Xs = sx.transform(np.asarray(Xnew, dtype=np.float32))
         if to3d:
             Xs = Xs.reshape(*Xs.shape, 1)
-        return keras_probabilities(model.predict(Xs, verbose=0))
+        return keras_probabilities(keras_predict(model, Xs))
 
     return model, proba_fn
 
@@ -1745,11 +1841,57 @@ def make_study():
     #  direction="minimize" throughout, and every objective returns
     #  -PRIMARY_METRIC (or a loss), so "lower is better" holds uniformly even
     #  though the reported metric is one where higher is better.
+    #
+    #  n_warmup_steps=1: a trial may be pruned after its FIRST reported fold
+    #  rather than its third. On the Keras models a fold is a whole network
+    #  training, so this is the difference between abandoning a hopeless
+    #  configuration after one training and after three.
     return optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=SEED, multivariate=True),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=2),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=1),
     )
+
+
+def run_study(objective, key):
+    """
+    Run one model's search under the profile's trial count AND wall-clock
+    budget, reporting progress as it goes.
+
+    Two things this fixes. First, a search that prints nothing for forty
+    minutes is indistinguishable from one that has hung, so every tenth trial
+    reports the best score so far and the elapsed time. Second, `timeout`
+    bounds the damage: Optuna finishes the trial in flight and then stops,
+    keeping the best parameters found, so an expensive model degrades into a
+    shorter search instead of stalling the notebook.
+
+    A search cut short by the timeout says so, loudly — an under-searched model
+    must not be mistaken for a fully tuned one when reading the results table.
+    """
+    n_target = N_TRIALS[key]
+    study = make_study()
+    t0 = time.time()
+
+    def progress(st, trial):
+        done = len(st.trials)
+        if done % max(1, n_target // 10) and done != n_target:
+            return
+        try:
+            best = f"{-st.best_value:.4f}"
+        except ValueError:
+            best = "n/a"
+        print(f"    [{key}] trial {done}/{n_target}  best {PRIMARY_METRIC}={best}"
+              f"  {(time.time() - t0) / 60:.1f} min", flush=True)
+
+    study.optimize(objective, n_trials=n_target, timeout=STUDY_TIMEOUT,
+                   callbacks=[progress])
+
+    if STUDY_TIMEOUT is not None and len(study.trials) < n_target:
+        print(f"    [{key}] hit the {STUDY_TIMEOUT}s budget after "
+              f"{len(study.trials)}/{n_target} trials — these parameters are the "
+              f"best of a SHORTENED search. Raise STUDY_TIMEOUT, or accept it and "
+              f"say so when reporting this model.", flush=True)
+    return study
 
 
 # =============================================================================
@@ -1788,8 +1930,7 @@ def mlp_search(X, y):
         balanced   = trial.suggest_categorical("balanced", [False, True])
         return keras_cv_loss(build_mlp(units, activation, l2, dropout, lr),
                              X, y, batch_size=batch_size, trial=trial, balanced=balanced)
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["mlp"])
+    study = run_study(objective, "mlp")
     return study.best_params, -study.best_value
 
 
@@ -1923,8 +2064,7 @@ def xgb_search(X, y):
         trial.set_user_attr("n_estimators", int(np.median(best_iters)) + 1)
         return float(-np.nanmean(fold_scores))
 
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["xgb"])
+    study = run_study(objective, "xgb")
     best = dict(study.best_params)
     best["n_estimators"] = study.best_trial.user_attrs["n_estimators"]
     return best, -study.best_value
@@ -2040,8 +2180,7 @@ def lgbm_search(X, y):
         trial.set_user_attr("n_estimators", int(np.median(best_iters)) + 1)
         return float(-np.nanmean(fold_scores))
 
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["lgbm"])
+    study = run_study(objective, "lgbm")
     best = dict(study.best_params)
     best["n_estimators"] = study.best_trial.user_attrs["n_estimators"]
     return best, -study.best_value
@@ -2110,8 +2249,7 @@ def cnn_lstm_search(X, y):
             build_cnn_lstm(filters, kernel_size, pool, lstm_units, dropout,
                            rec_dropout, dense_units, lr),
             X, y, batch_size=batch_size, to3d=True, trial=trial, balanced=balanced)
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["cnn_lstm"])
+    study = run_study(objective, "cnn_lstm")
     return study.best_params, -study.best_value
 
 
@@ -2242,8 +2380,7 @@ def svc_search(X, y):
         s = cross_val_score(pipe, X, y, cv=inner_cv, scoring=SCORING, n_jobs=-1)
         return float(-s.mean())
 
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["svc"])
+    study = run_study(objective, "svc")
     return study.best_params, -study.best_value
 
 
@@ -2295,8 +2432,7 @@ def seq_logit_search(X, y):
         balanced   = trial.suggest_categorical("balanced", [False, True])
         return keras_cv_loss(build_logit(lr, l1, l2), X, y,
                              batch_size=batch_size, trial=trial, balanced=balanced)
-    study = make_study()
-    study.optimize(objective, n_trials=N_TRIALS["seq_logit"])
+    study = run_study(objective, "seq_logit")
     return study.best_params, -study.best_value
 
 
@@ -2578,11 +2714,19 @@ def make_voting_spec(name, members, weighting="uniform"):
 #  differ. That is why the family groups (S2-S4) are included alongside the
 #  cross-family ones (S1, S5): the comparison shows whether diversity actually
 #  bought anything on your data, which is a result worth reporting either way.
-TREE_MEMBERS    = [rf, xgboost_model, lgbm, ada]        # bagging + 3 boosting variants
-NEURAL_MEMBERS  = [mlp, cnn_lstm, seq_logit]            # the Keras family
-KERNEL_MEMBERS  = [svc, knn]                            # kernel + instance-based
-DIVERSE_MEMBERS = [rf, xgboost_model, mlp, svc, knn]    # one strong pick per family
-ALL_MEMBERS     = [rf, mlp, svc, xgboost_model, lgbm, ada, knn, cnn_lstm, seq_logit]
+#  Membership follows the `models` roster in Section 4, so commenting a model
+#  out there removes it from every ensemble too. Without this, dropping the
+#  expensive Keras models from `models` would leave the ensembles holding
+#  untuned specs and _require_tuned() would stop the run — which is exactly
+#  what you do NOT want when you dropped them to save time.
+_ACTIVE = {id(m) for m in models}
+_pick = lambda group: [m for m in group if id(m) in _ACTIVE]
+
+TREE_MEMBERS    = _pick([rf, xgboost_model, lgbm, ada])     # bagging + 3 boosting variants
+NEURAL_MEMBERS  = _pick([mlp, cnn_lstm, seq_logit])         # the Keras family
+KERNEL_MEMBERS  = _pick([svc, knn])                         # kernel + instance-based
+DIVERSE_MEMBERS = _pick([rf, xgboost_model, mlp, svc, knn]) # one strong pick per family
+ALL_MEMBERS     = list(models)
 
 # Stacking (LogisticRegressionCV meta-learner on OOF probabilities)
 S1 = make_stacking_spec("S1 Stack (All 9)",        ALL_MEMBERS)
@@ -2600,9 +2744,23 @@ V4 = make_voting_spec("V4 Vote (Kernel+KNN)",    KERNEL_MEMBERS)
 V5 = make_voting_spec("V5 Vote (Cross-family)",  DIVERSE_MEMBERS)
 V6 = make_voting_spec("V6 Vote (All 9, wtd)",    ALL_MEMBERS, weighting="inverse_logloss")
 
-stacking_models = [S1, S2, S3, S4, S5]
-voting_models   = [V1, V2, V3, V4, V5, V6]
+#  An ensemble of fewer than two members is just that member under another
+#  name, so groups emptied by the roster filter above are dropped rather than
+#  reported as duplicates.
+_group_size = {"S1": len(ALL_MEMBERS), "S2": len(TREE_MEMBERS), "S3": len(NEURAL_MEMBERS),
+               "S4": len(KERNEL_MEMBERS), "S5": len(DIVERSE_MEMBERS),
+               "V1": len(ALL_MEMBERS), "V2": len(TREE_MEMBERS), "V3": len(NEURAL_MEMBERS),
+               "V4": len(KERNEL_MEMBERS), "V5": len(DIVERSE_MEMBERS), "V6": len(ALL_MEMBERS)}
+_keep = lambda tag, spec: spec if _group_size[tag] >= 2 else None
+
+stacking_models = [m for m in (_keep("S1", S1), _keep("S2", S2), _keep("S3", S3),
+                               _keep("S4", S4), _keep("S5", S5)) if m is not None]
+voting_models   = [m for m in (_keep("V1", V1), _keep("V2", V2), _keep("V3", V3),
+                               _keep("V4", V4), _keep("V5", V5), _keep("V6", V6)) if m is not None]
 ensemble_models = stacking_models + voting_models
+if len(ensemble_models) < 11:
+    print(f"\n{11 - len(ensemble_models)} ensemble(s) skipped: their member group has "
+          f"fewer than two models in the current `models` roster.")
 
 
 # =============================================================================
@@ -2657,7 +2815,7 @@ all_models = models + ensemble_models
 SWEEP_METRICS = ("Accuracy", "F1", "ROC_AUC", "MCC")
 
 _min_class_count = int(np.bincount(y_tr, minlength=N_CLASSES).min())
-fold_range = range(2, min(11, _min_class_count + 1))
+fold_range = range(2, min(SWEEP_MAX_K, _min_class_count + 1))
 if fold_range.stop <= 2:
     raise ValueError(f"rarest class has only {_min_class_count} training row(s) — "
                      f"not enough to cross-validate. Collect more data for it, "
@@ -2822,7 +2980,7 @@ def _fname(name):
 #  seq_logit fall back to a manual sweep built on spec.refit_on(), which reuses
 #  the same already-tuned hyperparameters without repeating the search.
 # =============================================================================
-train_sizes_pct = np.linspace(0.1, 1.0, 10)
+train_sizes_pct = np.linspace(0.1, 1.0, LC_SIZES)
 lc_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 
 #  A learning curve's smallest slice must still contain every class (and, for
@@ -3837,7 +3995,6 @@ taylor_df_train = build_taylor(roc_specs, X_tr, y_tr, "train")
 # =============================================================================
 from scipy.stats import mode as scipy_mode
 
-N_BOOTSTRAP = 20
 bv_models = models          # e.g. [rf, xgboost_model, lgbm, knn] for a faster pass
 
 

@@ -89,10 +89,38 @@ data and switches scorers, curves and averaging conventions accordingly.
 Figures are written as PNGs and the tables as `results_*.csv`; the target's
 label mapping is written to `target_label_encoding.csv`.
 
-### Cost
+### Cost — set the tuning profile first
 
-The default search budgets (60 randomized draws, 25-80 Optuna trials per model)
-are sized for a real run, not a quick look. To try it out fast, lower
-`N_ITER_RANDOM` and `N_TRIALS` in Section 0 and `SEED_SCAN_N` in Section A, and
-trim the `models` list. `SVC(probability=True)` and the three Keras models
-dominate the runtime, and the ensembles refit their members.
+Runtime is dominated by the three Keras models. One Optuna trial trains a
+network once per CV fold, and the neural models are refit again by the K-fold
+sweep, the learning curves, the bias-variance bootstrap and every ensemble
+containing them — roughly **1,000 network fits** at the `"full"` budget. That
+is an afternoon on a GPU and 2-8 hours on a notebook CPU, where the first
+symptom is the search appearing to hang on "Shallow MLP".
+
+`TUNING_PROFILE` in Section 0 controls this:
+
+| Profile | Optuna trials (MLP) | Keras epochs | Search folds | Budget per model |
+| --- | --- | --- | --- | --- |
+| `"fast"` | 8 | 120 | 3 | 300 s |
+| `"balanced"` (default) | 20 | 200 | 3 | 900 s |
+| `"full"` | 40 | 300 | 5 | unlimited |
+
+The profile also scales the K-fold sweep, the learning-curve resolution and
+the bias-variance bootstrap. `STUDY_TIMEOUT` is a hard wall-clock bound on each
+model's search: Optuna finishes the trial in flight, keeps the best parameters
+found, and says so — a shortened search is reported, never silently passed off
+as a complete one. Every search prints progress, so a long run is
+distinguishable from a stuck one.
+
+**The biggest single saving** is dropping the neural models, which on small
+tabular data rarely beat the boosted trees:
+
+```python
+models = [rf, svc, xgboost_model, lgbm, ada, knn]      # Section 4
+```
+
+That removes every Keras fit in the file. Ensemble membership follows the
+`models` roster, so groups left with fewer than two members are skipped
+automatically. `SVC(probability=True)` is then the slowest remaining model,
+because calibration fits it once per fold.
