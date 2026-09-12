@@ -223,6 +223,130 @@ keras_cv = StratifiedKFold(n_splits=KERAS_CV_SPLITS, shuffle=True, random_state=
 
 RESULTS = {}   # name -> dict of test metrics, filled in by report()
 
+
+# =============================================================================
+#  SECTION C — OUTPUT COLLECTION  (every figure separately, every table in one
+#  workbook)
+# =============================================================================
+#  Two rules for everything this file produces:
+#
+#  FIGURES. One file per analysis, and — where an analysis covers several
+#  features, metrics or parameters — one file per FEATURE, METRIC or PARAMETER
+#  as well. Multi-panel grids are still drawn, because they are how you scan a
+#  dataset, but a grid is a contact sheet, not a deliverable: a single panel of
+#  it cannot be dropped into a paper, resized, or referenced on its own. So the
+#  grids are kept AND each panel is written separately, into a subdirectory per
+#  analysis so the count stays navigable.
+#
+#  TABLES. Every result table is registered as it is produced and the whole set
+#  is written to ONE Excel workbook at the end, one sheet per table. Scattering
+#  a dozen CSVs across a working directory makes them easy to lose and easy to
+#  mismatch; a single workbook keeps a run's numbers together and dated.
+# =============================================================================
+import re
+
+OUTPUT_DIR   = "outputs"
+FIGURE_DIR   = os.path.join(OUTPUT_DIR, "figures")
+RESULTS_XLSX = os.path.join(OUTPUT_DIR, "results.xlsx")
+
+RESULT_TABLES = {}      # sheet name -> DataFrame, written by export_tables()
+SAVED_FIGURES = []      # every path written, reported at the end
+
+#  Write one figure per feature / per metric / per pair in addition to the
+#  scan grids. Costs a little time in the EDA (the data is already computed)
+#  and one extra partial-dependence pass per model in Part 7; set False if you
+#  only want the grids.
+PER_ITEM_FIGURES = True
+
+
+def _slug(name):
+    """A filename that survives every OS: no spaces, slashes or punctuation."""
+    out = re.sub(r"[^\w\-.]+", "_", str(name).strip())
+    return re.sub(r"_+", "_", out).strip("_") or "figure"
+
+
+def _fname(name):
+    """A model name as a filename fragment. Defined here rather than in Part 6
+    because Part 5 names files too."""
+    return name.replace(' ', '_').replace('(', '').replace(')', '').replace(',', '')
+
+
+def save_fig(fig=None, name="figure", subdir="", dpi=300, close=False):
+    """
+    Write one figure to outputs/figures/<subdir>/<name>.png.
+
+    Centralised so that resolution, background and bounding box are identical
+    everywhere, and so the full list of outputs can be reported at the end
+    rather than left for you to find.
+
+    close defaults to False because the callers render with plt.show() and then
+    close: the inline notebook backend releases a figure on show(), so writing
+    it afterwards would produce a blank file.
+    """
+    fig = fig or plt.gcf()
+    name = str(name)
+    if name.lower().endswith(".png"):      # tolerate callers that pass a filename
+        name = name[:-4]
+    directory = os.path.join(FIGURE_DIR, subdir) if subdir else FIGURE_DIR
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{_slug(name)}.png")
+    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="white")
+    SAVED_FIGURES.append(path)
+    if close:
+        plt.close(fig)
+    return path
+
+
+def _sheet_name(name, taken):
+    """
+    Excel sheet names: 31 characters, and none of : \ / ? * [ ].
+    Truncating blindly collides (two long names share a prefix), so collisions
+    are resolved with a numeric suffix rather than silently overwriting a sheet.
+    """
+    clean = re.sub(r"[:\\/?*\[\]]", "-", str(name)).strip() or "Sheet"
+    clean = clean[:31]
+    if clean not in taken:
+        return clean
+    stem = clean[:28]
+    for i in range(2, 100):
+        candidate = f"{stem}_{i}"
+        if candidate not in taken:
+            return candidate
+    raise ValueError(f"cannot make a unique sheet name for {name!r}")
+
+
+def register_table(name, df, index=False):
+    """Keep a result table for the single Excel export at the end."""
+    df = df.reset_index() if index else df
+    RESULT_TABLES[name] = df.copy()
+    return df
+
+
+def export_tables(path=RESULTS_XLSX):
+    """Write every registered table to one workbook, one sheet per table."""
+    if not RESULT_TABLES:
+        print("No tables registered — nothing to export.")
+        return None
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    taken = {}
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for name, df in RESULT_TABLES.items():
+            sheet = _sheet_name(name, taken)
+            taken[sheet] = name
+            # Objects such as dicts of best params do not survive Excel's type
+            # coercion, so anything non-scalar is written as its repr.
+            safe = df.copy()
+            for col in safe.columns:
+                if safe[col].dtype == object:
+                    safe[col] = safe[col].map(
+                        lambda v: v if isinstance(v, (str, int, float, bool, type(None)))
+                        else repr(v))
+            safe.to_excel(writer, sheet_name=sheet, index=False)
+    print(f"\n{len(RESULT_TABLES)} table(s) written to {path}")
+    for sheet, name in taken.items():
+        print(f"    [{sheet}] {name}  ({len(RESULT_TABLES[name])} rows)")
+    return path
+
 # ---- Target encoding state (populated by encode_target() in Section A) -------
 #  These are module-level on purpose: the metric functions below, the Keras
 #  heads in Part 4, and the plotting code in Part 6 all need to know how many
@@ -632,6 +756,8 @@ def nested_cv_score(make_search, X, y, cv=None, label=""):
 # =============================================================================
 from sklearn.model_selection import train_test_split
 from scipy.stats import ks_2samp
+from scipy.stats import (pearsonr as st_pearsonr, spearmanr as st_spearmanr,
+                         kendalltau as st_kendalltau)
 
 # ---- Load the dataset -------------------------------------------------------
 #  Colab path first (as in the source notebook), with a plain-filesystem
@@ -888,13 +1014,18 @@ x_test  = pd.DataFrame(x_test,  columns=X.columns)
 
 print(f"\nTrain: {x_train.shape}   Test: {x_test.shape}")
 print("Class balance —")
-print(pd.DataFrame({
+_balance = pd.DataFrame({
     "class":      [CLASSES[i] for i in range(N_CLASSES)],
     "train_n":    np.bincount(y_train, minlength=N_CLASSES),
     "train_share": (np.bincount(y_train, minlength=N_CLASSES) / len(y_train)).round(4),
     "test_n":     np.bincount(y_test, minlength=N_CLASSES),
     "test_share": (np.bincount(y_test, minlength=N_CLASSES) / len(y_test)).round(4),
-}).to_string(index=False))
+})
+print(_balance.to_string(index=False))
+register_table("Class balance", _balance)
+register_table("Target encoding",
+               pd.DataFrame({"encoded": range(N_CLASSES), "original": CLASSES}))
+register_table("Split seed scan", seed_scan.head(50))
 
 
 # -----------------------------------------------------------------------------
@@ -1429,13 +1560,16 @@ print("SUMMARY STATISTICS (features)")
 print("=" * 78)
 summary_df = summary_stats(df[FEATURE_COLS])
 print(summary_df.round(4).to_string())
+register_table("EDA summary stats", summary_df, index=True)
 
 # Per-class summary: a feature whose mean differs sharply across classes is one
 # the models will lean on. This is the table form of the plots below.
 print("\n" + "=" * 78)
 print("PER-CLASS FEATURE MEANS")
 print("=" * 78)
-print(df.groupby(target_name)[FEATURE_COLS].mean().round(4).T.to_string())
+_per_class_means = df.groupby(target_name)[FEATURE_COLS].mean().T
+print(_per_class_means.round(4).to_string())
+register_table("Per-class feature means", _per_class_means, index=True)
 
 
 def _eda_grid(n, ncols=2, row_height=4.3):
@@ -1490,7 +1624,7 @@ def plot_class_balance(df, target):
                 fontsize=10, color=INK_SOFT)
 
     plt.tight_layout()
-    plt.savefig("eda_class_balance.png", dpi=300, bbox_inches='tight')
+    save_fig(plt.gcf(), "eda_class_balance", subdir="eda")
     plt.show()
     plt.close(fig)
 
@@ -1501,64 +1635,87 @@ def plot_class_balance(df, target):
 #  whose curves separate is directly usable by the classifier. (Overlap here
 #  does not prove uselessness — the feature may still matter in combination
 #  with another, which is what the 2-way PDPs in Part 7 show.)
+def _draw_class_density(ax, df, target, column):
+    """One feature's class-conditional density. Shared by the grid and the
+    stand-alone per-feature figure so the two can never drift apart."""
+    if PER_CLASS_EDA:
+        for cls in CLASSES:
+            vals = df.loc[df[target] == cls, column]
+            if vals.nunique() > 1:
+                sns.kdeplot(vals, ax=ax, color=CLASS_COLORS[cls], linewidth=2,
+                            fill=True, alpha=0.18, label=str(cls))
+            else:
+                ax.axvline(vals.iloc[0], color=CLASS_COLORS[cls],
+                           linewidth=2, label=str(cls))
+    else:
+        sns.kdeplot(df[column], ax=ax, color=SERIES_COLORS[0], linewidth=2,
+                    fill=True, alpha=0.18, label="all rows")
+    _style(ax, f"{column} by class", column, "Density")
+    ax.legend(title=None, fontsize=8, frameon=False)
+
+
 def plot_class_conditional_densities(df, target, ncols=2):
     columns = FEATURE_COLS
     n = len(columns)
     fig, axs, nrows, ncols = _eda_grid(n, ncols)
-
     for i, column in enumerate(columns):
-        ax = axs[i // ncols, i % ncols]
-        if PER_CLASS_EDA:
-            for cls in CLASSES:
-                vals = df.loc[df[target] == cls, column]
-                if vals.nunique() > 1:
-                    sns.kdeplot(vals, ax=ax, color=CLASS_COLORS[cls], linewidth=2,
-                                fill=True, alpha=0.18, label=str(cls))
-                else:
-                    ax.axvline(vals.iloc[0], color=CLASS_COLORS[cls],
-                               linewidth=2, label=str(cls))
-        else:
-            sns.kdeplot(df[column], ax=ax, color=SERIES_COLORS[0], linewidth=2,
-                        fill=True, alpha=0.18, label="all rows")
-        _style(ax, f"{column} by class", column, "Density")
-        ax.legend(title=None, fontsize=8, frameon=False)
-
+        _draw_class_density(axs[i // ncols, i % ncols], df, target, column)
     _hide_unused_axes(fig, axs, n, nrows, ncols)
     plt.tight_layout()
-    plt.savefig("eda_class_conditional_densities.png", dpi=300, bbox_inches='tight')
+    save_fig(plt.gcf(), "eda_class_conditional_densities", subdir="eda")
     plt.show()
     plt.close(fig)
+
+    if PER_ITEM_FIGURES:
+        for column in columns:
+            f1, ax1 = plt.subplots(figsize=(6.4, 4.4))
+            _draw_class_density(ax1, df, target, column)
+            f1.tight_layout()
+            save_fig(f1, f"density_{column}", subdir="eda/per_feature", close=True)
 
 
 # ── GROUPED BOX PLOTS (feature vs class) ─────────────────────────────────────
 #  The direct structural replacement for scatter(feature, target): same axes
 #  roles (feature on y, target on x), with the target's categorical nature
 #  respected. Non-overlapping boxes = a separable feature.
+def _draw_class_boxplot(ax, df, target, column):
+    """One feature's distribution grouped by class, plus its outlier count."""
+    if PER_CLASS_EDA:
+        sns.boxplot(data=df, x=target, y=column, ax=ax, hue=target,
+                    palette=CLASS_COLORS, legend=False, width=0.55,
+                    linecolor=INK, linewidth=1.0, fliersize=3)
+    else:
+        sns.boxplot(data=df, y=column, ax=ax, color=SERIES_COLORS[0],
+                    width=0.4, linecolor=INK, linewidth=1.0, fliersize=3)
+    q1, q3 = df[column].quantile([0.25, 0.75])
+    iqr = q3 - q1
+    n_out = int(((df[column] < q1 - 1.5 * iqr) | (df[column] > q3 + 1.5 * iqr)).sum())
+    _style(ax, f"{column} by class  ({n_out} outliers overall)", target, column)
+    return n_out
+
+
 def plot_boxplots_by_class(df, target, ncols=2):
     columns = FEATURE_COLS
     n = len(columns)
     fig, axs, nrows, ncols = _eda_grid(n, ncols, row_height=4.0)
-
+    outliers = {}
     for i, column in enumerate(columns):
-        ax = axs[i // ncols, i % ncols]
-        if PER_CLASS_EDA:
-            sns.boxplot(data=df, x=target, y=column, ax=ax, hue=target,
-                        palette=CLASS_COLORS, legend=False, width=0.55,
-                        linecolor=INK, linewidth=1.0, fliersize=3)
-        else:
-            sns.boxplot(data=df, y=column, ax=ax, color=SERIES_COLORS[0],
-                        width=0.4, linecolor=INK, linewidth=1.0, fliersize=3)
-
-        q1, q3 = df[column].quantile([0.25, 0.75])
-        iqr = q3 - q1
-        n_out = int(((df[column] < q1 - 1.5 * iqr) | (df[column] > q3 + 1.5 * iqr)).sum())
-        _style(ax, f"{column} by class  ({n_out} outliers overall)", target, column)
-
+        outliers[column] = _draw_class_boxplot(axs[i // ncols, i % ncols], df, target, column)
     _hide_unused_axes(fig, axs, n, nrows, ncols)
     plt.tight_layout()
-    plt.savefig("eda_boxplots_by_class.png", dpi=300, bbox_inches='tight')
+    save_fig(plt.gcf(), "eda_boxplots_by_class", subdir="eda")
     plt.show()
     plt.close(fig)
+
+    if PER_ITEM_FIGURES:
+        for column in columns:
+            f1, ax1 = plt.subplots(figsize=(6.0, 4.4))
+            _draw_class_boxplot(ax1, df, target, column)
+            f1.tight_layout()
+            save_fig(f1, f"boxplot_{column}", subdir="eda/per_feature", close=True)
+
+    register_table("EDA outlier counts",
+                   pd.DataFrame({"feature": list(outliers), "outliers": list(outliers.values())}))
 
 
 # ── CORRELATION HEATMAPS (features only) ─────────────────────────────────────
@@ -1572,22 +1729,116 @@ def plot_boxplots_by_class(df, target, ncols=2):
 #  the arbitrary order LabelEncoder assigned, and reporting it is a real
 #  mistake, not a cosmetic one. Feature-target association gets its own,
 #  correctly-defined chart below.
+_CORR_TESTS = {"pearson": st_pearsonr, "spearman": st_spearmanr, "kendall": st_kendalltau}
+
+#  Significance thresholds, annotated on every correlation cell.
+#  NOTE THE MAPPING: one star marks p < 0.01 and two stars p < 0.05, as
+#  specified. That is the reverse of the common journal convention (where more
+#  stars means a smaller p), so the legend is printed on every figure and the
+#  exact p-values are exported alongside — a reader should never have to guess
+#  which way round it is. Swap the two constants to use the usual convention.
+SIG_ONE_STAR = 0.01     # p < 0.01  ->  *
+SIG_TWO_STAR = 0.05     # p < 0.05  ->  **
+
+
+def correlation_with_pvalues(data, method):
+    """
+    Correlation matrix AND the matrix of two-sided p-values for it.
+
+    pandas .corr() gives coefficients only, so the tests are run pairwise here.
+    A pair that cannot be tested — a constant column has no variance, so the
+    correlation is undefined rather than zero — yields NaN and is left
+    unannotated instead of being reported as a non-significant result.
+    """
+    cols = list(data.columns)
+    r = pd.DataFrame(np.eye(len(cols)), index=cols, columns=cols, dtype=float)
+    pv = pd.DataFrame(np.zeros((len(cols), len(cols))), index=cols, columns=cols, dtype=float)
+    test = _CORR_TESTS[method]
+    for i, a in enumerate(cols):
+        for j, b in enumerate(cols):
+            if j >= i:
+                continue
+            try:
+                stat, pval = test(data[a], data[b])
+            except Exception:
+                stat, pval = np.nan, np.nan
+            r.loc[a, b] = r.loc[b, a] = stat
+            pv.loc[a, b] = pv.loc[b, a] = pval
+    return r, pv
+
+
+def significance_stars(pval):
+    """'' / '*' / '**' under the thresholds above."""
+    if pval is None or not np.isfinite(pval):
+        return ""
+    if pval < SIG_ONE_STAR:
+        return "*"
+    if pval < SIG_TWO_STAR:
+        return "**"
+    return ""
+
+
 def plot_correlation_heatmaps(df, methods=('pearson', 'spearman', 'kendall')):
+    """
+    Lower-triangle correlation heatmap per method, annotated with the
+    coefficient and its significance stars.
+
+    THE DIAGONAL IS REMOVED. Every variable correlates perfectly with itself,
+    so the diagonal is a row of 1.00 that carries no information, anchors the
+    colour scale at its extreme, and draws the eye away from the off-diagonal
+    cells that are the point of the plot.
+
+    Three methods because they answer different questions: Pearson measures
+    LINEAR association, Spearman and Kendall measure MONOTONIC association and
+    are robust to outliers and non-linear-but-ordered relationships.
+
+    The encoded target is deliberately EXCLUDED. Correlating a feature with a
+    class index is only meaningful for a binary target (where Pearson r is the
+    point-biserial correlation); for 3+ classes the number depends entirely on
+    the arbitrary order LabelEncoder assigned, and reporting it is a real
+    mistake, not a cosmetic one. Feature-target association gets its own,
+    correctly-defined chart below.
+    """
     for method in methods:
-        fig, ax = plt.subplots(figsize=(9, 7))
-        correlations = df[FEATURE_COLS].corr(method=method)
-        mask = np.triu(np.ones_like(correlations, dtype=bool), k=1)
-        sns.heatmap(correlations, mask=mask, annot=len(FEATURE_COLS) <= 15,
+        corr, pvals = correlation_with_pvalues(df[FEATURE_COLS], method)
+
+        labels = corr.copy().astype(object)
+        for a in FEATURE_COLS:
+            for b in FEATURE_COLS:
+                labels.loc[a, b] = ("" if not np.isfinite(corr.loc[a, b])
+                                    else f"{corr.loc[a, b]:.2f}{significance_stars(pvals.loc[a, b])}")
+
+        #  k=0 masks the diagonal as well as the upper triangle; k=1 would keep
+        #  the diagonal, which is the default and is what we do not want here.
+        mask = np.triu(np.ones_like(corr, dtype=bool), k=0)
+
+        fig, ax = plt.subplots(figsize=(9.5, 7.5))
+        sns.heatmap(corr, mask=mask, annot=labels if len(FEATURE_COLS) <= 15 else False,
                     cmap=DIVERGING, vmin=-1, vmax=1, center=0, square=True,
                     linewidths=1, linecolor='white', cbar_kws={"shrink": 0.8},
-                    annot_kws={"size": 9}, fmt='.2f', cbar=True, ax=ax)
+                    annot_kws={"size": 8.5}, fmt='', cbar=True, ax=ax)
         ax.set_title(f"{method.capitalize()} correlation — features",
                      fontsize=13, fontweight='bold', color=INK)
         ax.tick_params(labelsize=9, colors=INK_SOFT)
-        plt.tight_layout()
-        plt.savefig(f"eda_{method}_correlation_heatmap.png", dpi=300, bbox_inches='tight')
+        fig.text(0.5, 0.005,
+                 f"*  p < {SIG_ONE_STAR}      **  p < {SIG_TWO_STAR}      "
+                 f"unmarked: not significant at {SIG_TWO_STAR}      diagonal omitted",
+                 ha='center', fontsize=9, color=INK_SOFT)
+        plt.tight_layout(rect=(0, 0.03, 1, 1))
+        save_fig(plt.gcf(), f"eda_{method}_correlation_heatmap", subdir="eda")
         plt.show()
         plt.close(fig)
+
+        #  Exported long-form: the heatmap shows the stars, the table carries
+        #  the exact p-values a reviewer will ask for.
+        rows = []
+        for i, a in enumerate(FEATURE_COLS):
+            for j, b in enumerate(FEATURE_COLS):
+                if j < i:
+                    rows.append({"feature_a": a, "feature_b": b,
+                                 "coefficient": corr.loc[a, b], "p_value": pvals.loc[a, b],
+                                 "stars": significance_stars(pvals.loc[a, b])})
+        register_table(f"Corr {method}", pd.DataFrame(rows))
 
 
 # ── FEATURE -> TARGET ASSOCIATION ────────────────────────────────────────────
@@ -1612,10 +1863,11 @@ def plot_feature_target_association(X_df, y_enc):
     print("=" * 78)
     print(assoc.round(4).to_string(index=False))
 
+    panels = [("MutualInfo", SERIES_COLORS[0], "Mutual information (nats)"),
+              ("ANOVA_F",    SERIES_COLORS[1], "ANOVA F statistic")]
+
     fig, axes = plt.subplots(1, 2, figsize=(13, max(4, 0.32 * len(assoc))))
-    for ax, col, color, label in [
-            (axes[0], "MutualInfo", SERIES_COLORS[0], "Mutual information (nats)"),
-            (axes[1], "ANOVA_F",    SERIES_COLORS[1], "ANOVA F statistic")]:
+    for ax, (col, color, label) in zip(axes, panels):
         d = assoc.sort_values(col)
         ax.barh(d["feature"], d[col], color=color, height=0.62)
         _style(ax, label, label, None)
@@ -1623,9 +1875,20 @@ def plot_feature_target_association(X_df, y_enc):
     fig.suptitle("Which features carry signal about the class?",
                  fontsize=13, fontweight='bold', color=INK)
     plt.tight_layout()
-    plt.savefig("eda_feature_target_association.png", dpi=300, bbox_inches='tight')
+    save_fig(plt.gcf(), "eda_feature_target_association", subdir="eda")
     plt.show()
     plt.close(fig)
+
+    if PER_ITEM_FIGURES:
+        for col, color, label in panels:
+            f1, ax1 = plt.subplots(figsize=(7, max(3.5, 0.32 * len(assoc))))
+            d = assoc.sort_values(col)
+            ax1.barh(d["feature"], d[col], color=color, height=0.62)
+            _style(ax1, label, label, None)
+            ax1.grid(axis='y', visible=False)
+            f1.tight_layout()
+            save_fig(f1, f"association_{col}", subdir="eda", close=True)
+    register_table("Feature-target association", assoc)
     return assoc
 
 
@@ -2456,6 +2719,95 @@ models = [rf, mlp, svc, xgboost_model, lgbm, ada, knn, cnn_lstm, seq_logit]
 
 
 # =============================================================================
+#  SEARCH-SPACE REGISTRY  (for the hyperparameter report in Part 6)
+# =============================================================================
+#  The Grid/Randomized models carry their space as a dict already, so those
+#  entries point straight at it and can never fall out of step with what is
+#  actually searched. The Optuna models define their space IMPERATIVELY, inside
+#  the objective, as a sequence of trial.suggest_* calls — there is no object to
+#  introspect — so the ranges are mirrored declaratively here for reporting.
+#
+#  That mirror is the one thing in this file that can silently drift: change a
+#  suggest_* bound in Part 4 and this table will keep quoting the old one. The
+#  consistency check below catches the common half of that (a parameter that
+#  appears in the tuned result but is missing here) and warns; it cannot detect
+#  a bound that was edited in one place only, so change them together.
+SEARCH_SPACES = {
+    "Random Forest":                  rf_space,     # dict, as searched
+    "AdaBoost":                       ada_grid,     # dict, as searched
+    "KNN":                            knn_grid,     # dict, as searched
+    "XGBoost": {
+        "learning_rate":    "log-uniform [0.01, 0.3]",
+        "max_depth":        "int [2, 12]",
+        "min_child_weight": "log-uniform [0.01, 20.0]",
+        "subsample":        "uniform [0.5, 1.0]",
+        "colsample_bytree": "uniform [0.4, 1.0]",
+        "gamma":            "log-uniform [1e-8, 5.0]",
+        "reg_alpha":        "log-uniform [1e-8, 10.0]",
+        "reg_lambda":       "log-uniform [1e-8, 20.0]",
+        "scale_pos_weight": "log-uniform [0.5, 2.0] x n_neg/n_pos (binary only)",
+        "n_estimators":     "not searched - median best_iteration from per-fold early stopping",
+    },
+    "LightGBM": {
+        "learning_rate":     "log-uniform [0.01, 0.3]",
+        "num_leaves":        "int, log [8, 256]",
+        "max_depth":         "int [3, 15]",
+        "min_child_samples": "int [5, 100]",
+        "subsample":         "uniform [0.5, 1.0]",
+        "subsample_freq":    "int [0, 7]",
+        "colsample_bytree":  "uniform [0.4, 1.0]",
+        "reg_alpha":         "log-uniform [1e-8, 10.0]",
+        "reg_lambda":        "log-uniform [1e-8, 20.0]",
+        "class_weight":      "{None, balanced}",
+        "n_estimators":      "not searched - median best_iteration from per-fold early stopping",
+    },
+    "SVM (SVC)": {
+        "kernel":       "{rbf, poly, sigmoid, linear}",
+        "C":            "log-uniform [1e-2, 1e4]",
+        "class_weight": "{None, balanced}",
+        "gamma":        "log-uniform [1e-5, 1e1]  (non-linear kernels only)",
+        "degree":       "int [2, 4]  (poly only)",
+        "coef0":        "uniform [-1.0, 1.0]  (poly and sigmoid only)",
+    },
+    "Shallow MLP": {
+        "units":      "int, log [8, 256]",
+        "activation": "{relu, tanh, selu}",
+        "l2":         "log-uniform [1e-6, 1e-2]",
+        "dropout":    "uniform [0.0, 0.5]",
+        "lr":         "log-uniform [1e-4, 1e-2]",
+        "batch_size": "{16, 32, 64, 128}",
+        "balanced":   "{False, True}  (class-weighted sample weights)",
+    },
+    "CNN-LSTM": {
+        "filters":     "{16, 32, 64, 128}",
+        "kernel_size": "int [2, 5]",
+        "pool":        "{True, False}",
+        "lstm_units":  "{16, 32, 64, 128}",
+        "dropout":     "uniform [0.0, 0.5]",
+        "rec_dropout": "uniform [0.0, 0.3]",
+        "dense_units": "{8, 16, 32, 64}",
+        "lr":          "log-uniform [1e-4, 5e-3]",
+        "batch_size":  "{16, 32, 64}",
+        "balanced":    "{False, True}  (class-weighted sample weights)",
+    },
+    "Sequential Logistic Regression": {
+        "lr":         "log-uniform [1e-4, 1e-1]",
+        "l1":         "log-uniform [1e-8, 1e-2]",
+        "l2":         "log-uniform [1e-8, 1e-2]",
+        "batch_size": "{16, 32, 64, 128}",
+        "balanced":   "{False, True}  (class-weighted sample weights)",
+    },
+}
+
+SEARCH_STRATEGY = {
+    "Random Forest": "RandomizedSearchCV", "AdaBoost": "GridSearchCV",
+    "KNN": "GridSearchCV", "XGBoost": "Optuna TPE", "LightGBM": "Optuna TPE",
+    "SVM (SVC)": "Optuna TPE", "Shallow MLP": "Optuna TPE",
+    "CNN-LSTM": "Optuna TPE", "Sequential Logistic Regression": "Optuna TPE",
+}
+
+
+# =============================================================================
 #  SECTION 4B — CUSTOM ENSEMBLE LEARNING ALGORITHMS  (stacking & soft voting)
 # =============================================================================
 #  Meta-models built ON TOP of the 9 tuned base models above. Each one is
@@ -2849,23 +3201,44 @@ def fold_sweep(spec, X, y, fold_range=fold_range):
 
 sweep_results = {spec.name: fold_sweep(spec, X_tr, y_tr) for spec in models}
 
-# One figure per model: 2x2 grid of Accuracy / F1 / ROC-AUC / MCC vs fold count
+def _draw_sweep(ax, res, metric, color):
+    means, stds = res[metric]["means"], res[metric]["stds"]
+    ax.errorbar(list(fold_range), means, yerr=stds, marker='o', markersize=5,
+                capsize=4, linestyle='-', linewidth=2, color=color,
+                ecolor=GRID_COLOR, elinewidth=2)
+    _style(ax, metric, 'Number of folds (k)', metric)
+    ax.set_xticks(list(fold_range))
+
+
+# One grid per model to scan, plus one figure per metric to actually use.
+_sweep_rows = []
 for spec in models:
     res = sweep_results[spec.name]
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     for ax, metric, color in zip(axes.ravel(), SWEEP_METRICS, SERIES_COLORS):
-        means, stds = res[metric]["means"], res[metric]["stds"]
-        ax.errorbar(list(fold_range), means, yerr=stds, marker='o', markersize=5,
-                    capsize=4, linestyle='-', linewidth=2, color=color,
-                    ecolor=GRID_COLOR, elinewidth=2)
-        _style(ax, metric, 'Number of folds (k)', metric)
-        ax.set_xticks(list(fold_range))
+        _draw_sweep(ax, res, metric, color)
     fig.suptitle(f'K-Fold stability: {spec.name}', fontsize=13,
                  fontweight='bold', color=INK)
     fig.tight_layout()
-    fig.savefig(f"K-Fold_{spec.name.replace(' ', '_')}.png", dpi=300, bbox_inches='tight')
+    save_fig(fig, f"K-Fold_{spec.name.replace(' ', '_')}", subdir="kfold_stability")
     plt.show()
     plt.close(fig)
+
+    if PER_ITEM_FIGURES:
+        for metric, color in zip(SWEEP_METRICS, SERIES_COLORS):
+            f1, ax1 = plt.subplots(figsize=(6.4, 4.4))
+            _draw_sweep(ax1, res, metric, color)
+            ax1.set_title(f"{spec.name} — {metric}", fontsize=12,
+                          fontweight='bold', color=INK)
+            f1.tight_layout()
+            save_fig(f1, f"kfold_{_fname(spec.name)}_{metric}",
+                     subdir="kfold_stability/per_metric", close=True)
+
+    for metric in SWEEP_METRICS:
+        for k, mean, std in zip(fold_range, res[metric]["means"], res[metric]["stds"]):
+            _sweep_rows.append({"Model": spec.name, "Metric": metric, "k": k,
+                                "mean": mean, "std": std})
+register_table("K-fold stability", pd.DataFrame(_sweep_rows))
 
 
 # =============================================================================
@@ -2886,6 +3259,7 @@ print("HELD-OUT TEST SUMMARY  (sorted by ROC-AUC)")
 print("=" * 78)
 print(summary.round(4).to_string())
 print("=" * 78)
+register_table("Test summary", summary, index=True)
 
 for spec in all_models:
     print(f"\n{spec.name}: {spec.best_params}")
@@ -2903,6 +3277,10 @@ print(classification_report(y_te, best_spec.predict(X_te),
                             labels=list(range(N_CLASSES)),
                             target_names=[str(c) for c in CLASSES],
                             digits=4, zero_division=0))
+register_table("Per-class report (best)", pd.DataFrame(classification_report(
+    y_te, best_spec.predict(X_te), labels=list(range(N_CLASSES)),
+    target_names=[str(c) for c in CLASSES], output_dict=True,
+    zero_division=0)).T, index=True)
 
 # ---- Optional: nested CV for the cheap, Grid/RandomizedSearchCV-tuned models
 # for spec in (rf, ada, knn):
@@ -2912,6 +3290,113 @@ print(classification_report(y_te, best_spec.predict(X_te),
 # svc.fit(X_tr, y_tr)
 # svc.evaluate(X_te, y_te)
 # new_proba = svc.predict_proba(X_te)
+
+
+# =============================================================================
+#  SECTION 7B — HYPERPARAMETER REPORT  (search space vs. chosen value)
+# =============================================================================
+#  One row per hyperparameter: what was searched, over what range, and what the
+#  search chose.
+#
+#  ---------------------------------------------------------------------------
+#  WHY "TRAINING" AND "TESTING" HOLD THE SAME VALUE
+#  ---------------------------------------------------------------------------
+#  Both columns are reported, as asked, and they are deliberately identical.
+#  Hyperparameters are chosen ONCE, by cross-validation inside the training set,
+#  and then applied unchanged to the held-out test set. There is no separate
+#  "best parameters for the test set", and producing one would mean selecting
+#  hyperparameters by test score — which is test-set leakage: the reported test
+#  metric would become the maximum over many configurations rather than an
+#  estimate of generalisation, and it would not reproduce.
+#
+#  So the "Testing" column records what was actually APPLIED at test time. The
+#  train-vs-test comparison that is worth having lives in the companion table
+#  below, which pairs each model's CV score with its training and test scores —
+#  the gap between them is the thing the two columns are usually wanted for.
+# =============================================================================
+def _fmt_value(v):
+    if isinstance(v, float):
+        return f"{v:.6g}"
+    return "None" if v is None else str(v)
+
+
+def _describe_space(space_entry):
+    """A search space — dict entry or grid list — as one readable string."""
+    if space_entry is None:
+        return "not searched (fixed)"
+    if isinstance(space_entry, str):
+        return space_entry
+    if isinstance(space_entry, (list, tuple, set)):
+        vals = list(space_entry)
+        shown = ", ".join(_fmt_value(v) for v in vals[:6])
+        return "{" + shown + "}" if len(vals) <= 6 else \
+               "{" + shown + f", ...}}  ({len(vals)} values)"
+    return str(space_entry)
+
+
+def _bare(param):
+    """Drop the pipeline prefixes so the report reads as the model's own API."""
+    return param.split("__")[-1] if param.startswith("model__") else param
+
+
+def build_hyperparameter_table(specs):
+    rows = []
+    for spec in specs:
+        space = SEARCH_SPACES.get(spec.name, {})
+        best = spec.best_params or {}
+        space_bare = {_bare(k): v for k, v in space.items()}
+        best_bare = {_bare(k): v for k, v in best.items()}
+
+        missing = sorted(set(best_bare) - set(space_bare))
+        if missing:
+            warnings.warn(f"{spec.name}: tuned parameter(s) {missing} are absent from "
+                          f"SEARCH_SPACES — the registry has drifted from the code.",
+                          stacklevel=2)
+
+        for param in sorted(set(space_bare) | set(best_bare)):
+            chosen = best_bare.get(param, None)
+            rows.append({
+                "Model": spec.name,
+                "Search strategy": SEARCH_STRATEGY.get(spec.name, ""),
+                "Hyperparameter": param,
+                "Search Space or Range": _describe_space(space_bare.get(param)),
+                "Best Parameter (Training)": _fmt_value(chosen) if param in best_bare else "not selected",
+                "Best Parameter (Testing)": _fmt_value(chosen) if param in best_bare else "not selected",
+            })
+    return pd.DataFrame(rows)
+
+
+hyperparam_df = build_hyperparameter_table(models)
+print("\n" + "=" * 78)
+print("HYPERPARAMETER SEARCH SPACE AND SELECTED VALUES")
+print("  Training and Testing columns are identical by construction: selection")
+print("  happens once on the training folds, and tuning on test would be leakage.")
+print("=" * 78)
+print(hyperparam_df.to_string(index=False))
+register_table("Hyperparameters", hyperparam_df)
+
+#  Companion: the model-level view, where train and test genuinely differ.
+_model_rows = []
+for spec in all_models:
+    tr = compute_metrics(y_tr, spec.predict(X_tr), spec.predict_proba(X_tr))
+    te = RESULTS[spec.name]
+    _model_rows.append({
+        "Model": spec.name,
+        "Search strategy": SEARCH_STRATEGY.get(spec.name, "ensemble"),
+        f"CV {PRIMARY_METRIC} (training folds)": spec.cv_score,
+        f"Train {PRIMARY_METRIC}": tr["ROC_AUC"], f"Test {PRIMARY_METRIC}": te["ROC_AUC"],
+        "Train F1": tr["F1"], "Test F1": te["F1"],
+        "Train MCC": tr["MCC"], "Test MCC": te["MCC"],
+        "Overfitting gap (train-test AUC)": tr["ROC_AUC"] - te["ROC_AUC"],
+        "Fit time (s)": spec.fit_time_s,
+        "Best parameters": spec.best_params,
+    })
+model_summary_df = pd.DataFrame(_model_rows).sort_values(f"Test {PRIMARY_METRIC}", ascending=False)
+print("\n" + "=" * 78)
+print("MODEL-LEVEL SUMMARY — where training and testing really do differ")
+print("=" * 78)
+print(model_summary_df.drop(columns=["Best parameters"]).round(4).to_string(index=False))
+register_table("Model summary", model_summary_df)
 
 
 # =============================================================================
@@ -2956,10 +3441,6 @@ def top_models(specs=None, n=ROC_MAX_MODELS, metric="ROC_AUC"):
 def comparison_colors(specs):
     """Fixed-slot hue assignment for one comparison figure."""
     return {s.name: SERIES_COLORS[i] for i, s in enumerate(specs)}
-
-
-def _fname(name):
-    return name.replace(' ', '_').replace('(', '').replace(')', '').replace(',', '')
 
 
 # =============================================================================
@@ -3093,8 +3574,7 @@ for spec in models:
     ax.legend(loc='lower right', fontsize=9)
 
     plt.tight_layout()
-    plt.savefig(f"learning_curve_{_fname(spec.name)}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"learning_curve_{_fname(spec.name)}", subdir="learning_curves")
     plt.show()
     plt.close(fig)
 
@@ -3116,8 +3596,7 @@ if lc_specs:
     ax.set_ylim(0.35, 1.02)
     ax.legend(loc='lower right', fontsize=8, ncol=2)
     plt.tight_layout()
-    plt.savefig("validation_curve_comparison.png", dpi=300, bbox_inches='tight',
-                facecolor='white')
+    save_fig(plt.gcf(), "validation_curve_comparison", subdir="learning_curves")
     plt.show()
     plt.close(fig)
 
@@ -3145,7 +3624,7 @@ for ax, metric, color in [(axes[0], "ROC_AUC", SERIES_COLORS[0]),
 fig.suptitle("Model comparison — ranking quality (AUC) vs decision quality (MCC)",
              fontsize=13, fontweight='bold', color=INK)
 plt.tight_layout()
-plt.savefig("test_metric_comparison.png", dpi=300, bbox_inches='tight', facecolor='white')
+save_fig(plt.gcf(), "test_metric_comparison", subdir="model_comparison")
 plt.show()
 plt.close(fig)
 
@@ -3177,11 +3656,13 @@ print("\n" + "=" * 78)
 print("TRAINING SET METRICS")
 print("=" * 78)
 print(results_df_Train.round(4).to_string(index=False))
+register_table("Train metrics", results_df_Train)
 
 print("\n" + "=" * 78)
 print("TEST SET METRICS")
 print("=" * 78)
 print(results_df_Test.round(4).to_string(index=False))
+register_table("Test metrics", results_df_Test)
 
 #  A model whose train AUC is much higher than its test AUC is fitting noise —
 #  the same gap the learning curves visualize directly. On classification watch
@@ -3201,6 +3682,7 @@ print("=" * 78)
 print(train_test_gap[["Model", "ROC_AUC (Train)", "ROC_AUC (Test)",
                       "AUC Gap (Train-Test)", "LogLoss (Train)", "LogLoss (Test)",
                       "LogLoss Gap (Test-Train)"]].round(4).to_string(index=False))
+register_table("Train vs test gap", train_test_gap)
 
 
 # =============================================================================
@@ -3280,8 +3762,7 @@ def plot_confusion_matrices(specs, X, y, dataset_label, threshold=None):
 
         plt.tight_layout(rect=(0, 0.03, 1, 0.96))
         suffix = "" if threshold is None else "_tuned_threshold"
-        plt.savefig(f"confusion_matrix_{_fname(spec.name)}_{dataset_label}{suffix}.png",
-                    dpi=300, bbox_inches='tight', facecolor='white')
+        save_fig(plt.gcf(), f"confusion_matrix_{_fname(spec.name)}_{dataset_label}{suffix}", subdir="confusion_matrices")
         plt.show()
         plt.close(fig)
 
@@ -3304,8 +3785,7 @@ def plot_confusion_grid(specs, X, y, dataset_label, ncols=4):
     fig.suptitle(f"Row-normalized confusion matrices — {dataset_label} set (recall %)",
                  fontsize=14, fontweight='bold', color=INK)
     plt.tight_layout(rect=(0, 0, 1, 0.97))
-    plt.savefig(f"confusion_matrix_grid_{dataset_label}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"confusion_matrix_grid_{dataset_label}", subdir="confusion_matrices")
     plt.show()
     plt.close(fig)
 
@@ -3332,6 +3812,7 @@ for spec in all_models:
                                           else "none"),
                       "n": worst[2]})
 print(pd.DataFrame(conf_rows).to_string(index=False))
+register_table("Worst confusions", pd.DataFrame(conf_rows))
 
 
 # =============================================================================
@@ -3447,8 +3928,7 @@ def plot_roc_single(spec, X, y, dataset_label="test"):
     _roc_axes(ax, f"ROC — {spec.name}  ({dataset_label})")
     ax.legend(loc='lower right', fontsize=8)
     plt.tight_layout()
-    plt.savefig(f"roc_{_fname(spec.name)}_{dataset_label}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"roc_{_fname(spec.name)}_{dataset_label}", subdir="roc_curves")
     plt.show()
     plt.close(fig)
 
@@ -3472,8 +3952,7 @@ def plot_roc_comparison(specs, X, y, dataset_label="test"):
                     framealpha=0.95, edgecolor=GRID_COLOR)
     leg.get_title().set_fontsize(8)
     plt.tight_layout()
-    plt.savefig(f"roc_comparison_{dataset_label}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"roc_comparison_{dataset_label}", subdir="roc_curves")
     plt.show()
     plt.close(fig)
 
@@ -3538,8 +4017,7 @@ def plot_pr_comparison(specs, X, y, dataset_label="test"):
                     frameon=True, framealpha=0.95, edgecolor=GRID_COLOR)
     leg.get_title().set_fontsize(8)
     plt.tight_layout()
-    plt.savefig(f"precision_recall_comparison_{dataset_label}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"precision_recall_comparison_{dataset_label}", subdir="pr_curves")
     plt.show()
     plt.close(fig)
 
@@ -3648,8 +4126,7 @@ def plot_calibration(specs, X, y, dataset_label="test"):
     ax_hist.set_yscale('log')
 
     plt.tight_layout()
-    plt.savefig(f"calibration_{dataset_label}.png", dpi=300, bbox_inches='tight',
-                facecolor='white')
+    save_fig(plt.gcf(), f"calibration_{dataset_label}", subdir="calibration")
     plt.show()
     plt.close(fig)
 
@@ -3658,6 +4135,7 @@ def plot_calibration(specs, X, y, dataset_label="test"):
     print("CALIBRATION QUALITY  (lower is better on all three)")
     print("=" * 78)
     print(calib_df.round(4).to_string(index=False))
+    register_table(f"Calibration {dataset_label}", calib_df)
     return calib_df
 
 
@@ -3740,8 +4218,7 @@ def plot_threshold_analysis(spec, X, y, dataset_label="test"):
     ax.set_ylim(0, 1.14)
     ax.legend(loc='lower center', fontsize=9, ncol=4)
     plt.tight_layout()
-    plt.savefig(f"threshold_sweep_{_fname(spec.name)}_{dataset_label}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"threshold_sweep_{_fname(spec.name)}_{dataset_label}", subdir="threshold")
     plt.show()
     plt.close(fig)
 
@@ -3756,6 +4233,7 @@ def plot_threshold_analysis(spec, X, y, dataset_label="test"):
     print(f"OPERATING POINTS — {spec.name} ({dataset_label})")
     print("=" * 78)
     print(table.to_string(index=False))
+    register_table(f"Operating points {dataset_label}", table)
     return table, candidates
 
 
@@ -3913,7 +4391,7 @@ def taylor_diagram(entries, sd_obs, title="Taylor Diagram", normalize=True,
               frameon=True, framealpha=0.95, edgecolor=GRID_COLOR)
     fig.tight_layout()
     if savepath:
-        fig.savefig(savepath, dpi=300, bbox_inches='tight', facecolor='white')
+        save_fig(fig, savepath, subdir="taylor")
     return fig, ax
 
 
@@ -3936,6 +4414,7 @@ def build_taylor(specs, X, y, dataset_label, normalize=True):
           f"(SD_obs = {sd_obs:.4f})")
     print("=" * 78)
     print(tdf.round(4).to_string(index=False))
+    register_table(f"Taylor {dataset_label}", tdf)
 
     tcolors = comparison_colors(specs)
     for zoom, suffix in [(False, ""), (True, "_zoom")]:
@@ -4058,6 +4537,7 @@ print("BIAS-VARIANCE DECOMPOSITION OF 0-1 LOSS")
 print("  Bias + Net variance = Avg 0-1 loss (residual ~ 0 confirms the identity)")
 print("=" * 78)
 print(bv_df.round(4).to_string(index=False))
+register_table("Bias-variance", bv_df)
 
 fig, ax = plt.subplots(figsize=(10.5, max(4.5, 0.42 * len(bv_df))))
 ypos = np.arange(len(bv_df))
@@ -4082,8 +4562,7 @@ ax.invert_yaxis()
 ax.legend(loc='lower right', fontsize=9, frameon=True, framealpha=0.95,
           edgecolor=GRID_COLOR)
 plt.tight_layout()
-plt.savefig("bias_variance_decomposition.png", dpi=300, bbox_inches='tight',
-            facecolor='white')
+save_fig(plt.gcf(), "bias_variance_decomposition", subdir="bias_variance")
 plt.show()
 plt.close(fig)
 
@@ -4131,8 +4610,7 @@ def plot_bias_variance_curve(spec, param_name, values, xlabel, n_bootstrap=10,
     ax.legend(loc='upper right', fontsize=9, frameon=True, framealpha=0.95,
               edgecolor=GRID_COLOR)
     plt.tight_layout()
-    plt.savefig(f"bias_variance_curve_{_fname(spec.name)}.png", dpi=300,
-                bbox_inches='tight', facecolor='white')
+    save_fig(plt.gcf(), f"bias_variance_curve_{_fname(spec.name)}", subdir="bias_variance")
     plt.show()
     plt.close(fig)
 
@@ -4369,7 +4847,7 @@ def _shap_figure(plot_fn, explanation, title, filename):
         plot_fn(explanation, show=False)
         plt.title(title, fontsize=13, fontweight='bold', color=INK)
         plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight', facecolor='white')
+        save_fig(plt.gcf(), filename, subdir="shap")
         plt.show()
     except Exception as exc:
         print(f"  SHAP plot skipped ({filename}): {type(exc).__name__}: {exc}")
@@ -4570,10 +5048,38 @@ def plot_ice(specs, X_plot, features=None, n_cols=N_COLS):
                      f"(P({CLASSES[SHAP_CLASS if not IS_BINARY else POS_LABEL]}))",
                      fontsize=14, fontweight='bold', color=INK)
         fig.tight_layout()
-        fig.savefig(f"ice_{_fname(spec.name)}.png", dpi=300, bbox_inches='tight',
-                    facecolor='white')
+        save_fig(fig, f"ice_{_fname(spec.name)}", subdir="ice_pdp")
         plt.show()
         plt.close(fig)
+
+        #  One figure per FEATURE as well. sklearn recomputes the partial
+        #  dependence for each call, so this costs a second pass over the
+        #  features per model — the reason it sits behind PER_ITEM_FIGURES.
+        if PER_ITEM_FIGURES:
+            for feat in features:
+                f1, ax1 = plt.subplots(figsize=(5.2, 4.0))
+                try:
+                    PartialDependenceDisplay.from_estimator(
+                        _SpecEstimator(spec), X_plot, features=[feat],
+                        feature_names=feature_names, target=PDP_TARGET,
+                        response_method='predict_proba', kind='both', subsample=50,
+                        centered=True, grid_resolution=PDP_GRID_1WAY, random_state=SEED,
+                        ice_lines_kw={'color': GRID_COLOR, 'alpha': 0.55, 'linewidth': 0.8},
+                        pd_line_kw={'color': ACCENT, 'linewidth': 2.5}, ax=ax1)
+                except Exception as exc:
+                    print(f"    per-feature ICE skipped for {spec.name}/"
+                          f"{feature_names[feat]}: {type(exc).__name__}")
+                    plt.close(f1)
+                    continue
+                ax1.set_title(f"{feature_names[feat]}", fontsize=11,
+                              fontweight='bold', color=INK)
+                ax1.grid(color=GRID_COLOR, linestyle='--', linewidth=0.5, alpha=0.8)
+                ax1.set_axisbelow(True)
+                if ax1.get_legend() is not None:
+                    ax1.get_legend().remove()
+                f1.tight_layout()
+                save_fig(f1, f"ice_{_fname(spec.name)}_{feature_names[feat]}",
+                         subdir="ice_pdp/per_feature", close=True)
 
 
 plot_ice(ice_models, X_pdp)
@@ -4607,6 +5113,16 @@ pdp_2way_models = [m for m in (rf, xgboost_model, lgbm) if any(x is m for x in m
 
 
 def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
+    """
+    Two-way partial dependence, ONE FIGURE PER PAIR.
+
+    A grid of fifteen contour plots is unreadable at any printable size, and
+    each pair is a separate analysis, so each is written as its own file.
+    sklearn is still called once per model with every pair — it computes them
+    in one pass — and the panels are then redrawn individually, so splitting
+    the output costs nothing extra. Two-way PD is (rows x grid^2) predictions
+    per pair, which is the expensive part and is paid either way.
+    """
     pairs = pairs if pairs is not None else pdp_pairs
     if not pairs:
         print("  fewer than two features — nothing to plot.")
@@ -4666,10 +5182,33 @@ def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
 
         fig.suptitle(f"2D partial dependence — {spec.name}",
                      fontsize=16, fontweight='bold', color=INK)
-        fig.savefig(f"pdp_2way_{_fname(spec.name)}.png", dpi=300, bbox_inches='tight',
-                    facecolor='white')
+        save_fig(fig, f"pdp_2way_{_fname(spec.name)}", subdir="ice_pdp")
         plt.show()
         plt.close(fig)
+
+        #  Re-plot each pair on its own, reusing the partial dependence sklearn
+        #  already computed above — no extra model evaluations.
+        if PER_ITEM_FIGURES:
+            for idx, pd_result in enumerate(display_obj.pd_results):
+                f0, f1i = pairs[idx]
+                grid_values = pd_result.get('grid_values', pd_result.get('values'))
+                Z = np.asarray(pd_result['average'])[0]
+                G0, G1 = np.meshgrid(grid_values[0], grid_values[1], indexing='ij')
+                fp, axp = plt.subplots(figsize=(6.0, 5.0), constrained_layout=True)
+                cf = axp.contourf(G0, G1, Z, levels=12, cmap=SEQ_BLUE)
+                cb = fp.colorbar(cf, ax=axp, pad=0.04)
+                cb.ax.tick_params(labelsize=9, colors=INK_SOFT)
+                cb.set_label(
+                    f"P({CLASSES[PDP_TARGET if PDP_TARGET is not None else POS_LABEL]})",
+                    fontsize=9, color=INK_SOFT)
+                axp.set_xlabel(feature_names[f0], fontsize=11, color=INK_SOFT)
+                axp.set_ylabel(feature_names[f1i], fontsize=11, color=INK_SOFT)
+                axp.set_title(f"{spec.name}: {feature_names[f0]} x {feature_names[f1i]}",
+                              fontsize=11, fontweight='bold', color=INK)
+                axp.tick_params(labelsize=9, colors=INK_SOFT)
+                save_fig(fp, f"pdp2_{_fname(spec.name)}_{feature_names[f0]}"
+                             f"_x_{feature_names[f1i]}",
+                         subdir="ice_pdp/per_pair", close=True)
 
 
 plot_pdp_2way(pdp_2way_models, X_pdp_2way)
@@ -4678,24 +5217,47 @@ plot_pdp_2way(pdp_2way_models, X_pdp_2way)
 # =============================================================================
 #  SECTION 15 — EXPORT
 # =============================================================================
-#  The tables are the deliverable as much as the figures are; writing them out
-#  means the write-up quotes the run rather than a retyped number.
+#  Every table registered anywhere above goes into ONE workbook, one sheet per
+#  table, rather than a scatter of CSVs: a run's numbers stay together, cannot
+#  be mismatched across runs, and open in the tool most people actually use to
+#  read them. Figures are already written per analysis (and per feature, metric
+#  or pair) under outputs/figures/.
 # =============================================================================
-summary.to_csv("results_summary_test.csv")
-results_df_Train.to_csv("results_train_metrics.csv", index=False)
-results_df_Test.to_csv("results_test_metrics.csv", index=False)
-calibration_df.to_csv("results_calibration.csv", index=False)
-bv_df.to_csv("results_bias_variance.csv", index=False)
-taylor_df_test.to_csv("results_taylor_test.csv", index=False)
-pd.DataFrame([{"Model": s.name, "best_params": s.best_params,
-               f"CV_{PRIMARY_METRIC}": s.cv_score, "fit_time_s": s.fit_time_s}
-              for s in all_models]).to_csv("results_best_params.csv", index=False)
-pd.DataFrame({"encoded": range(N_CLASSES), "original": CLASSES}).to_csv(
-    "target_label_encoding.csv", index=False)
+register_table("Ensemble composition", pd.DataFrame([
+    {"Ensemble": spec.name,
+     "Members": ", ".join((spec.best_params or {}).get("members", [])),
+     "Combination": (spec.best_params or {}).get("meta")
+                    or (spec.best_params or {}).get("weighting", ""),
+     "Weights / blend": (spec.best_params or {}).get("weights")
+                        or (spec.best_params or {}).get("blend_weights", "")}
+    for spec in ensemble_models]))
+
+register_table("Run configuration", pd.DataFrame([
+    {"setting": "tuning profile",        "value": TUNING_PROFILE},
+    {"setting": "primary metric",        "value": PRIMARY_METRIC},
+    {"setting": "sklearn scoring",       "value": SCORING},
+    {"setting": "resampling",            "value": str(RESAMPLING)},
+    {"setting": "split seed",            "value": BEST_SEED},
+    {"setting": "test size",             "value": TEST_SIZE},
+    {"setting": "classes",               "value": ", ".join(map(str, CLASSES))},
+    {"setting": "positive class",        "value": str(CLASSES[POS_LABEL]) if IS_BINARY else "n/a"},
+    {"setting": "features",              "value": N_FEATURES},
+    {"setting": "train rows",            "value": len(y_tr)},
+    {"setting": "test rows",             "value": len(y_te)},
+    {"setting": "models",                "value": ", ".join(m.name for m in models)},
+]))
+
+export_tables()
+
+print(f"\n{len(SAVED_FIGURES)} figure(s) written under {FIGURE_DIR}/")
+_by_dir = {}
+for _path in SAVED_FIGURES:
+    _by_dir.setdefault(os.path.dirname(_path), []).append(_path)
+for _d in sorted(_by_dir):
+    print(f"    {_d}/  ({len(_by_dir[_d])} figures)")
 
 print("\n" + "=" * 78)
-print("DONE. Tables written to results_*.csv; the label mapping to "
-      "target_label_encoding.csv.")
+print(f"DONE. Tables -> {RESULTS_XLSX}   Figures -> {FIGURE_DIR}/")
 print(f"Best model by test ROC-AUC: {best_spec.name} "
       f"({RESULTS[best_spec.name]['ROC_AUC']:.4f})")
 print("=" * 78)
