@@ -4,6 +4,25 @@
 
 Theres a markdown file in this repository
 
+## Notebooks
+
+Both workflows are also available as notebooks, with the documentation in
+markdown cells and the code in code cells:
+
+| Notebook | Cells |
+| --- | --- |
+| `classification_models_tuned.ipynb` | 79 markdown, 66 code |
+| `regression_models_tuned.ipynb` | 55 markdown, 42 code |
+
+They are generated from the scripts and carry the same code, unchanged and in
+the same order, so either form can be run. The comments that documented a
+section became markdown; short comments explaining the line they sit on stayed
+with their code.
+
+Note that `regression_models_tuned.py` is not itself in this branch (it was
+added to `main` and then deleted), so `regression_models_tuned.ipynb` is the
+copy of that workflow here.
+
 ## `classification_models_tuned.py`
 
 A tuned multi-model **classification** benchmark: the classification
