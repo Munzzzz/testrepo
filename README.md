@@ -33,7 +33,7 @@ mechanically.
 ### Running it
 
 ```bash
-pip install -U scikit-learn xgboost lightgbm optuna tensorflow shap matplotlib seaborn
+pip install -U scikit-learn imbalanced-learn xgboost lightgbm optuna tensorflow shap matplotlib seaborn
 ```
 
 Then set three things near the top of Section A and run the file top to bottom
@@ -44,6 +44,12 @@ Then set three things near the top of Section A and run the file top to bottom
 | `CSV_PATH` | path to your CSV (Google Drive path, local path, or the `CSV_PATH` env var) |
 | `TARGET_COL` | the class-label column |
 | `POSITIVE_LABEL` | for a binary target, which original label counts as "positive" |
+
+To turn on class rebalancing, set `RESAMPLING` in Section B (e.g. `"smote"`).
+Section B documents the trade it makes: recall usually rises, precision falls,
+ROC-AUC barely moves, and the probabilities become miscalibrated — so if the
+goal is simply to stop missing the minority class, moving the decision
+threshold (Section 8E) does the same job for free and keeps calibration.
 
 Binary and multiclass targets are both handled; the file detects which from the
 data and switches scorers, curves and averaging conventions accordingly.
@@ -58,21 +64,26 @@ data and switches scorers, curves and averaging conventions accordingly.
    datetime, constant and identifier feature columns are encoded or dropped;
    the split seed is chosen on train/test distribution match, and the split is
    stratified.
-3. **EDA** — class balance, per-class feature distributions, grouped box plots,
+3. **Class rebalancing (optional)** — SMOTE and variants (Borderline, SVM,
+   ADASYN, SMOTE-NC, SMOTE+Tomek, SMOTE+ENN) via the `RESAMPLING` knob in
+   Section B, off by default. The sampler is a pipeline step, never a
+   preprocessing call, so it is applied to each fold's training part only —
+   never to a validation fold and never to the test set.
+4. **EDA** — class balance, per-class feature distributions, grouped box plots,
    feature correlation heatmaps, and ANOVA-F / mutual-information association
    with the target.
-4. **Model space** — 9 tuned models: Random Forest, Shallow MLP, SVC, XGBoost,
+5. **Model space** — 9 tuned models: Random Forest, Shallow MLP, SVC, XGBoost,
    LightGBM, AdaBoost, KNN, CNN-LSTM, Sequential Logistic Regression, plus 11
    stacking and soft-voting ensembles built on their probabilities.
-5. **Hyperparameter optimization** — GridSearchCV / RandomizedSearchCV / Optuna
+6. **Hyperparameter optimization** — GridSearchCV / RandomizedSearchCV / Optuna
    per model, all on one objective, plus a K-fold count stability sweep.
-6. **Evaluation** — **confusion matrices** (counts and row-normalized),
+7. **Evaluation** — **confusion matrices** (counts and row-normalized),
    **ROC curves** (per model and overlaid; one-vs-rest with micro/macro
    averages for multiclass), precision-recall curves, calibration curves with
    ECE, a decision-threshold sweep, learning curves, a Taylor diagram on the
    predicted probabilities, a Kohavi-Wolpert 0-1 loss bias-variance
    decomposition, and seed sensitivity.
-7. **Factor importance** — SHAP (bar, beeswarm, violin, waterfall, dependence)
+8. **Factor importance** — SHAP (bar, beeswarm, violin, waterfall, dependence)
    and ICE / 1-way and 2-way partial dependence.
 
 Figures are written as PNGs and the tables as `results_*.csv`; the target's

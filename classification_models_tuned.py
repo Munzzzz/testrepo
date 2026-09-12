@@ -867,6 +867,227 @@ N_FEATURES = X_tr.shape[1]
 
 
 # =============================================================================
+#  SECTION B — CLASS REBALANCING (SMOTE AND FRIENDS)
+# =============================================================================
+#  SMOTE (Synthetic Minority Over-sampling TEchnique, Chawla et al. 2002) grows
+#  the minority class by interpolating between a minority point and one of its
+#  k nearest minority neighbours, rather than duplicating rows the way naive
+#  random oversampling does.
+#
+#  ---------------------------------------------------------------------------
+#  THE ONE RULE: RESAMPLE INSIDE THE FOLD, NEVER BEFORE THE SPLIT
+#  ---------------------------------------------------------------------------
+#  This is the mistake that makes published SMOTE results irreproducible, and
+#  it is worth being precise about WHY, because the leakage is not obvious:
+#
+#      X_res, y_res = SMOTE().fit_resample(X, y)      # <-- WRONG
+#      cross_val_score(model, X_res, y_res, cv=5)
+#
+#  A synthetic point is a blend of a real minority row and one of its
+#  neighbours. Resample first, and a synthetic row built partly from row 37 can
+#  land in the training folds while row 37 itself lands in the validation fold.
+#  The model has then effectively seen the answer, and every CV score rises —
+#  often dramatically, and entirely fictitiously. Worse, duplicated-ish points
+#  land on both sides of the split, so the validation fold is no longer
+#  independent at all. The held-out test score does not move, and the gap gets
+#  blamed on "overfitting" rather than on the leak that caused it.
+#
+#  So the sampler is a PIPELINE STEP here, never a preprocessing call. An
+#  imblearn Pipeline applies its sampler during fit() and skips it during
+#  predict()/predict_proba(), which is exactly the required behaviour:
+#    * each CV fold resamples only its own training part;
+#    * the validation fold keeps its real class balance;
+#    * the held-out test set is never resampled, so every number in Part 6 is
+#      measured at the prevalence the model will actually meet.
+#  sklearn's own Pipeline cannot do this — it would try to apply the sampler at
+#  predict time — which is why imblearn.pipeline.Pipeline is imported below.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT TO EXPECT, HONESTLY
+#  ---------------------------------------------------------------------------
+#  SMOTE is not a free accuracy upgrade, and this pipeline is instrumented well
+#  enough to show you exactly what it does and does not buy:
+#
+#    * ROC-AUC usually barely moves. AUC measures RANKING and is insensitive to
+#      class prevalence, and resampling does not give the model new information
+#      — it re-weights what is already there. If SMOTE "fixes" your AUC, be
+#      suspicious of a leak.
+#    * RECALL on the minority class usually rises and PRECISION usually falls,
+#      because the decision boundary moves toward the majority class. Watch F1,
+#      MCC and the confusion matrices (Section 8), not accuracy.
+#    * CALIBRATION GETS WORSE. Resampling changes the effective class prior, so
+#      the model's probabilities no longer estimate P(class | x) on the real
+#      population — they are systematically too high for the minority class.
+#      Expect LogLoss, Brier and ECE to degrade in Section 8D. That is not a
+#      bug, it is the trade.
+#
+#  Which means: if what you actually want is to stop missing the minority
+#  class, MOVING THE DECISION THRESHOLD (Section 8E) does the same job, costs
+#  nothing, adds no synthetic data, and leaves the probabilities calibrated.
+#  Reach for SMOTE when the minority class is so small that the model cannot
+#  learn its SHAPE at all, not merely when the counts look lopsided. Running
+#  both settings and comparing the Part 6 tables is the way to decide, and this
+#  file is set up to make that a one-line change.
+#
+#  ---------------------------------------------------------------------------
+#  SMOTE AND class_weight ARE BOTH IMBALANCE CORRECTIONS
+#  ---------------------------------------------------------------------------
+#  Every model here already carries class_weight in its search space. Applying
+#  'balanced' weights ON TOP of a balanced resample corrects the same imbalance
+#  twice and pushes the boundary past the minority class. Both are left in the
+#  space deliberately — the search can select class_weight=None once resampling
+#  is on, and letting it choose against the CV objective is more defensible
+#  than asserting either. But if you are comparing runs, know that this is a
+#  2x2 of corrections, not a single switch.
+# =============================================================================
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE, BorderlineSMOTE, SVMSMOTE, ADASYN, SMOTENC
+from imblearn.combine import SMOTETomek, SMOTEENN
+
+#  THE KNOB. None disables resampling entirely (the sampler step becomes a
+#  no-op, so nothing else in the file changes shape).
+#    "smote"       vanilla SMOTE — interpolates between minority neighbours.
+#    "borderline"  BorderlineSMOTE — synthesises only near the decision
+#                  boundary, where the classifier is actually confused. Usually
+#                  the better default when the minority class is not compact.
+#    "svm"         SVMSMOTE — uses an SVM's support vectors to pick where to
+#                  synthesise. Slower; good when the boundary is curved.
+#    "adasyn"      ADASYN — allocates more synthetic points to minority rows
+#                  that are HARD (many majority neighbours). Sharpens focus on
+#                  the difficult region; also amplifies label noise there.
+#    "smotenc"     SMOTE-NC — treats the flagged columns as categorical and
+#                  copies the majority category of the neighbours instead of
+#                  interpolating. See the one-hot note below.
+#    "smote_tomek" / "smote_enn"
+#                  oversample, then CLEAN: remove the borderline majority rows
+#                  (Tomek links) or the misclassified ones (edited nearest
+#                  neighbours). Useful when SMOTE alone leaves the classes
+#                  smeared into each other. These shrink the majority class too,
+#                  so they change both sides of the balance.
+RESAMPLING = None
+SMOTE_K    = 5          # requested k_neighbors; clamped below to what the folds allow
+
+
+#  ONE-HOT COLUMNS AND SYNTHETIC ROWS.
+#  Section A one-hot encoded the categorical features, so the matrix contains
+#  0/1 indicator columns. Plain SMOTE interpolates them like any other number
+#  and produces values such as region_north = 0.37 — a row that is 37% in a
+#  category. Trees tolerate that (they just split it somewhere), but it is
+#  meaningless for the distance and linear models, and it quietly changes what
+#  the SHAP and PDP plots in Part 7 are describing.
+#  SMOTENC is the fix that works post-encoding: it assigns each flagged column
+#  the most common value among the neighbours, so the dummies stay 0/1. It is
+#  still imperfect — the dummies of one original variable are decided
+#  independently, so a synthetic row can end up in two categories or none. The
+#  fully correct approach is to run SMOTENC on the data BEFORE one-hot
+#  encoding; this is the practical approximation given where the encoding sits.
+BINARY_FEATURE_IDX = [j for j in range(N_FEATURES)
+                      if np.isin(np.unique(X_tr[:, j]), (0.0, 1.0)).all()]
+if BINARY_FEATURE_IDX and RESAMPLING in ("smote", "borderline", "svm", "adasyn"):
+    print(f"\nNote: {len(BINARY_FEATURE_IDX)} of {N_FEATURES} feature(s) are 0/1 indicators. "
+          f"{RESAMPLING!r} will interpolate them into fractions; RESAMPLING='smotenc' "
+          f"keeps them binary.")
+
+
+def resolve_smote_k(y, n_splits=5, requested=SMOTE_K):
+    """
+    Largest usable k_neighbors.
+
+    SMOTE needs k minority NEIGHBOURS, so it requires k < (minority count) in
+    whatever data it is fitted on — and since it is fitted per fold, the
+    binding constraint is the minority count in a TRAINING FOLD, not in the
+    whole training set. Getting this wrong surfaces as
+    "Expected n_neighbors <= n_samples" from deep inside a CV loop, hours in.
+    """
+    smallest = int(np.bincount(y, minlength=N_CLASSES).min())
+    in_fold  = int(np.floor(smallest * (n_splits - 1) / n_splits))
+    return max(1, min(requested, in_fold - 1)), smallest, in_fold
+
+
+def make_sampler():
+    """A FRESH sampler instance, or None when resampling is off."""
+    if RESAMPLING is None:
+        return None
+    k, smallest, in_fold = resolve_smote_k(y_tr)
+    if in_fold < 2:
+        warnings.warn(
+            f"rarest class has ~{in_fold} row(s) per training fold — too few to "
+            f"synthesise from. Resampling disabled; collect more data for that "
+            f"class, merge it, or rely on class_weight and threshold moving.",
+            stacklevel=2)
+        return None
+    common = dict(random_state=SEED)
+    if RESAMPLING == "smote":        return SMOTE(k_neighbors=k, **common)
+    if RESAMPLING == "borderline":   return BorderlineSMOTE(k_neighbors=k, **common)
+    if RESAMPLING == "svm":          return SVMSMOTE(k_neighbors=k, **common)
+    if RESAMPLING == "adasyn":       return ADASYN(n_neighbors=k, **common)
+    if RESAMPLING == "smotenc":
+        if not BINARY_FEATURE_IDX:
+            warnings.warn("RESAMPLING='smotenc' but no 0/1 columns were found; "
+                          "falling back to plain SMOTE.", stacklevel=2)
+            return SMOTE(k_neighbors=k, **common)
+        return SMOTENC(categorical_features=BINARY_FEATURE_IDX, k_neighbors=k, **common)
+    if RESAMPLING == "smote_tomek":  return SMOTETomek(smote=SMOTE(k_neighbors=k, **common), **common)
+    if RESAMPLING == "smote_enn":    return SMOTEENN(smote=SMOTE(k_neighbors=k, **common), **common)
+    raise ValueError(f"unknown RESAMPLING={RESAMPLING!r}")
+
+
+def build_pipeline(steps):
+    """
+    Assemble a model pipeline with the sampler inserted immediately before the
+    final estimator.
+
+    `steps` is [... , ("model", estimator)] WITHOUT the sampler. The sampler
+    step always exists — as "passthrough" when resampling is off — so every
+    hyperparameter grid in Part 4 keeps one set of "model__" prefixes whether
+    or not resampling is enabled.
+
+    Position matters: the sampler sits AFTER any scaler, because SMOTE picks
+    neighbours by Euclidean distance and unscaled features would let the
+    largest-magnitude column decide who counts as a neighbour.
+    """
+    sampler = make_sampler() or "passthrough"
+    return ImbPipeline(list(steps[:-1]) + [("sampler", sampler)] + list(steps[-1:]))
+
+
+def resample_fit(X, y):
+    """
+    Resample a training split directly.
+
+    Used only by the models that cannot go through a Pipeline: XGBoost and
+    LightGBM early-stop against an eval_set (which must keep its real class
+    balance, so it must not be resampled), and the Keras nets scale and fit
+    fold by fold by hand. Call it on the TRAINING part of a split only.
+    """
+    sampler = make_sampler()
+    if sampler is None:
+        return X, y
+    Xr, yr = sampler.fit_resample(X, y)
+    return np.asarray(Xr, dtype=np.float32), np.asarray(yr, dtype=np.int64).ravel()
+
+
+# ── WHAT THE RESAMPLING ACTUALLY DOES ────────────────────────────────────────
+#  Illustration only. The real resampling happens inside each CV fold, on that
+#  fold's training part; this applies it once to the whole training set purely
+#  to report the shape of the change. Nothing below is fitted on it.
+if RESAMPLING is not None:
+    _k, _smallest, _in_fold = resolve_smote_k(y_tr)
+    print("\n" + "=" * 78)
+    print(f"CLASS REBALANCING — {RESAMPLING}")
+    print("=" * 78)
+    print(f"rarest class: {_smallest} training rows (~{_in_fold} per training fold) "
+          f"-> k_neighbors={_k}")
+    _Xr, _yr = resample_fit(X_tr, y_tr)
+    _before = np.bincount(y_tr, minlength=N_CLASSES)
+    _after  = np.bincount(_yr, minlength=N_CLASSES)
+    print(pd.DataFrame({"class": CLASSES, "before": _before, "after": _after,
+                        "change": _after - _before}).to_string(index=False))
+    print(f"training rows: {len(y_tr)} -> {len(_yr)}")
+    print("(illustration only — fitting resamples per fold, never on the test set)")
+    del _Xr, _yr
+
+
+# =============================================================================
 #  SECTION 1 — UNIFORM MODEL INTERFACE
 # =============================================================================
 #  Every model below — sklearn estimator, Optuna-tuned booster, or Keras net —
@@ -1432,6 +1653,12 @@ def keras_cv_loss(build_fn, X, y, batch_size=32, epochs=300, cv=None, to3d=False
         sx = SCALER_CLS().fit(Xtr)
         Xtr_s, Xva_s = sx.transform(Xtr), sx.transform(Xva)
 
+        # Resample AFTER scaling and on the training part only — SMOTE chooses
+        # neighbours by Euclidean distance, so it has to see comparable scales,
+        # and the validation fold must keep its real class balance or the score
+        # this function returns is measured on a population that does not exist.
+        Xtr_s, ytr = resample_fit(Xtr_s, ytr)
+
         if to3d:   # (n, f) -> (n, f, 1): the features act as the "sequence" axis
             Xtr_s = Xtr_s.reshape(Xtr_s.shape[0], Xtr_s.shape[1], 1)
             Xva_s = Xva_s.reshape(Xva_s.shape[0], Xva_s.shape[1], 1)
@@ -1479,21 +1706,26 @@ def keras_fit(build_fn, Xtr, ytr, batch_size, epochs=400, to3d=False,
     sx = SCALER_CLS().fit(Xtr[tr_i])
     Xt, Xv = sx.transform(Xtr[tr_i]), sx.transform(Xtr[va_i])
 
+    # Training portion only; the internal validation split keeps its real
+    # balance so early stopping is judged on realistic data.
+    yt_fit, yv_fit = ytr[tr_i], ytr[va_i]
+    Xt, yt_fit = resample_fit(Xt, yt_fit)
+
     if to3d:
         Xt = Xt.reshape(*Xt.shape, 1)
         Xv = Xv.reshape(*Xv.shape, 1)
 
-    sw_t = balanced_sample_weight(ytr[tr_i], balanced)
-    sw_v = balanced_sample_weight(ytr[va_i], balanced)
+    sw_t = balanced_sample_weight(yt_fit, balanced)
+    sw_v = balanced_sample_weight(yv_fit, balanced)
 
     keras.backend.clear_session()
     keras.utils.set_random_seed(SEED)
     model = build_fn(Xt.shape[1:])
     es = keras.callbacks.EarlyStopping(monitor="val_loss", patience=patience,
                                        restore_best_weights=True)
-    val_data = ((Xv, keras_targets(ytr[va_i])) if sw_v is None
-                else (Xv, keras_targets(ytr[va_i]), sw_v))
-    model.fit(Xt, keras_targets(ytr[tr_i]), validation_data=val_data, epochs=epochs,
+    val_data = ((Xv, keras_targets(yv_fit)) if sw_v is None
+                else (Xv, keras_targets(yv_fit), sw_v))
+    model.fit(Xt, keras_targets(yt_fit), validation_data=val_data, epochs=epochs,
               batch_size=batch_size, verbose=0, callbacks=[es], sample_weight=sw_t)
 
     def proba_fn(Xnew):
@@ -1587,21 +1819,29 @@ mlp = ModelSpec("Shallow MLP", mlp_search, mlp_refit)
 # =============================================================================
 from sklearn.ensemble import RandomForestClassifier
 
+#  Grid keys carry the "model__" prefix because every sklearn model in this
+#  file is assembled by build_pipeline() (Section B), which always includes a
+#  sampler step — "passthrough" when RESAMPLING is None. One set of names
+#  works whether or not resampling is on.
 rf_space = {
-    "n_estimators":      [300, 500, 800, 1200],
-    "max_depth":         [None, 5, 10, 15, 20, 30],
-    "min_samples_split": [2, 5, 10, 20],
-    "min_samples_leaf":  [1, 2, 4, 8],
-    "max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7, 1.0],
-    "bootstrap":         [True, False],
-    "criterion":         ["gini", "entropy"],
-    "class_weight":      [None, "balanced", "balanced_subsample"],
+    "model__n_estimators":      [300, 500, 800, 1200],
+    "model__max_depth":         [None, 5, 10, 15, 20, 30],
+    "model__min_samples_split": [2, 5, 10, 20],
+    "model__min_samples_leaf":  [1, 2, 4, 8],
+    "model__max_features":      ["sqrt", "log2", 0.3, 0.5, 0.7, 1.0],
+    "model__bootstrap":         [True, False],
+    "model__criterion":         ["gini", "entropy"],
+    "model__class_weight":      [None, "balanced", "balanced_subsample"],
 }
+
+
+def make_rf_estimator():
+    return build_pipeline([("model", RandomForestClassifier(random_state=SEED, n_jobs=-1))])
 
 
 def make_rf_search():
     return RandomizedSearchCV(
-        RandomForestClassifier(random_state=SEED, n_jobs=-1),
+        make_rf_estimator(),
         rf_space, n_iter=N_ITER_RANDOM, scoring=SCORING,
         cv=inner_cv, random_state=SEED, n_jobs=-1, refit=True)
 
@@ -1613,7 +1853,8 @@ def rf_search(X, y):
 
 
 def rf_refit(X, y, params):
-    m = RandomForestClassifier(random_state=SEED, n_jobs=-1, **params)
+    m = make_rf_estimator()
+    m.set_params(**params)
     m.fit(X, y)
     return m, m.predict_proba
 
@@ -1668,7 +1909,12 @@ def xgb_search(X, y):
             m = xgb.XGBClassifier(
                 n_estimators=3000, early_stopping_rounds=50, eval_metric=XGB_EVAL_METRIC,
                 tree_method="hist", random_state=SEED, n_jobs=-1, **params)
-            m.fit(X[tr], y[tr], eval_set=[(X[va], y[va])], verbose=False)
+            # Resample the TRAINING part of the fold only. The eval_set drives
+            # early stopping, so it has to keep the real class balance — stop
+            # on a rebalanced set and the chosen n_estimators is tuned for a
+            # population that does not exist.
+            Xf, yf = resample_fit(X[tr], y[tr])
+            m.fit(Xf, yf, eval_set=[(X[va], y[va])], verbose=False)
             fold_scores.append(primary_score(y[va], m.predict_proba(X[va])))
             best_iters.append(m.best_iteration)
             trial.report(float(-np.nanmean(fold_scores)), step=k)
@@ -1687,7 +1933,8 @@ def xgb_search(X, y):
 def xgb_refit(X, y, params):
     m = xgb.XGBClassifier(tree_method="hist", random_state=SEED, n_jobs=-1,
                           eval_metric=XGB_EVAL_METRIC, **params)
-    m.fit(X, y, verbose=False)
+    Xf, yf = resample_fit(X, y)
+    m.fit(Xf, yf, verbose=False)
     return m, m.predict_proba
 
 
@@ -1712,19 +1959,22 @@ from sklearn.ensemble import AdaBoostClassifier
 from sklearn.tree import DecisionTreeClassifier
 
 ada_grid = {
-    "estimator__max_depth":        [1, 2, 3, 4, 6, 8],
-    "estimator__min_samples_leaf": [1, 5],
-    "estimator__class_weight":     [None, "balanced"],
-    "n_estimators":                [50, 100, 300, 600],
-    "learning_rate":               [0.01, 0.05, 0.1, 0.5, 1.0],
+    "model__estimator__max_depth":        [1, 2, 3, 4, 6, 8],
+    "model__estimator__min_samples_leaf": [1, 5],
+    "model__estimator__class_weight":     [None, "balanced"],
+    "model__n_estimators":                [50, 100, 300, 600],
+    "model__learning_rate":               [0.01, 0.05, 0.1, 0.5, 1.0],
 }
 
 
+def make_ada_estimator():
+    return build_pipeline([("model", AdaBoostClassifier(
+        estimator=DecisionTreeClassifier(random_state=SEED), random_state=SEED))])
+
+
 def make_ada_search():
-    return GridSearchCV(
-        AdaBoostClassifier(estimator=DecisionTreeClassifier(random_state=SEED),
-                           random_state=SEED),
-        ada_grid, scoring=SCORING, cv=inner_cv, n_jobs=-1, refit=True)
+    return GridSearchCV(make_ada_estimator(), ada_grid, scoring=SCORING,
+                        cv=inner_cv, n_jobs=-1, refit=True)
 
 
 def ada_search(X, y):
@@ -1734,9 +1984,8 @@ def ada_search(X, y):
 
 
 def ada_refit(X, y, params):
-    m = AdaBoostClassifier(estimator=DecisionTreeClassifier(random_state=SEED),
-                           random_state=SEED)
-    m.set_params(**params)     # routes estimator__* to the nested DecisionTreeClassifier
+    m = make_ada_estimator()
+    m.set_params(**params)     # routes model__estimator__* to the nested tree
     m.fit(X, y)
     return m, m.predict_proba
 
@@ -1778,7 +2027,10 @@ def lgbm_search(X, y):
         for k, (tr, va) in enumerate(inner_cv.split(X, y)):
             m = lgb.LGBMClassifier(n_estimators=3000, random_state=SEED,
                                    n_jobs=-1, verbose=-1, **params)
-            m.fit(X[tr], y[tr], eval_set=[(X[va], y[va])], eval_metric=LGB_EVAL_METRIC,
+            # Training part only — the eval_set must keep the real balance, for
+            # the same reason as XGBoost above.
+            Xf, yf = resample_fit(X[tr], y[tr])
+            m.fit(Xf, yf, eval_set=[(X[va], y[va])], eval_metric=LGB_EVAL_METRIC,
                   callbacks=[lgb.early_stopping(50, verbose=False)])
             fold_scores.append(primary_score(y[va], m.predict_proba(X[va])))
             best_iters.append(m.best_iteration_ or 100)
@@ -1797,6 +2049,7 @@ def lgbm_search(X, y):
 
 def lgbm_refit(X, y, params):
     m = lgb.LGBMClassifier(random_state=SEED, n_jobs=-1, verbose=-1, **params)
+    X, y = resample_fit(X, y)
     m.fit(X, y)
     return m, m.predict_proba
 
@@ -1892,7 +2145,7 @@ cnn_lstm = ModelSpec("CNN-LSTM", cnn_lstm_search, cnn_lstm_refit)
 # =============================================================================
 from sklearn.neighbors import KNeighborsClassifier
 
-knn_pipe = Pipeline([("scaler", SCALER_CLS()), ("model", KNeighborsClassifier())])
+knn_pipe = build_pipeline([("scaler", SCALER_CLS()), ("model", KNeighborsClassifier())])
 
 max_k = min(40, max(2, len(X_tr) // 2))
 knn_grid = {
@@ -1915,7 +2168,7 @@ def knn_search(X, y):
 
 
 def knn_refit(X, y, params):
-    m = Pipeline([("scaler", SCALER_CLS()), ("model", KNeighborsClassifier())])
+    m = build_pipeline([("scaler", SCALER_CLS()), ("model", KNeighborsClassifier())])
     m.set_params(**params)
     m.fit(X, y)
     return m, m.predict_proba
@@ -1984,8 +2237,8 @@ def svc_search(X, y):
         if kernel in ("poly", "sigmoid"):
             params["coef0"] = trial.suggest_float("coef0", -1.0, 1.0)
 
-        pipe = Pipeline([("scaler", SCALER_CLS()),
-                         ("model", make_probabilistic_svc(**params))])
+        pipe = build_pipeline([("scaler", SCALER_CLS()),
+                               ("model", make_probabilistic_svc(**params))])
         s = cross_val_score(pipe, X, y, cv=inner_cv, scoring=SCORING, n_jobs=-1)
         return float(-s.mean())
 
@@ -1995,8 +2248,8 @@ def svc_search(X, y):
 
 
 def svc_refit(X, y, params):
-    m = Pipeline([("scaler", SCALER_CLS()),
-                  ("model", make_probabilistic_svc(**params))])
+    m = build_pipeline([("scaler", SCALER_CLS()),
+                        ("model", make_probabilistic_svc(**params))])
     m.fit(X, y)
     return m, m.predict_proba
 
@@ -3735,7 +3988,7 @@ plot_bias_variance_curve(
 
 # Random Forest: complexity increases with depth.
 plot_bias_variance_curve(
-    rf, "max_depth", [2, 3, 5, 8, 12, 20, None],
+    rf, "model__max_depth", [2, 3, 5, 8, 12, 20, None],
     xlabel="max_depth  (deeper = more complex)")
 
 
@@ -3866,18 +4119,42 @@ def _select_base(expected_value, cls):
     return float(ev[cls]) if ev.size > 1 else float(ev[0])
 
 
+def _raw_feature_estimator(model):
+    """
+    The estimator that may be explained on RAW features, or None.
+
+    Section B wraps every sklearn model in a pipeline, so spec.model is usually
+    a Pipeline and a plain type-name check would send the tree models down the
+    slow, approximate black-box path instead of exact TreeExplainer.
+
+    Unwrapping is only sound when nothing ahead of the final estimator CHANGES
+    the features. A sampler qualifies: it acts during fit and is a no-op at
+    transform time, so the fitted estimator still consumes raw columns. A
+    scaler does not — explaining it on unscaled values would silently
+    misattribute — so the KNN and SVC pipelines return None here and keep the
+    black-box path they were already on.
+    """
+    if not hasattr(model, "steps"):
+        return model
+    for _, step in model.steps[:-1]:
+        if step == "passthrough" or hasattr(step, "fit_resample"):
+            continue
+        return None
+    return model.steps[-1][1]
+
+
 # ── BUILD SHAP EXPLANATIONS FOR EACH MODEL ────────────────────────────────────
 explanations, explained_specs = [], []
 
 for spec in models:
-    model = spec.model
-    cls_name = type(model).__name__
+    model = _raw_feature_estimator(spec.model)
+    cls_name = type(model).__name__ if model is not None else ""
     try:
-        if any(k in cls_name for k in TREE_KEYS):
+        if model is not None and any(k in cls_name for k in TREE_KEYS):
             explainer = shap.TreeExplainer(model, feature_names=feature_names)
             values = explainer.shap_values(X_shap)
             base = _select_base(explainer.expected_value, SHAP_CLASS)
-        elif hasattr(model, "coef_"):
+        elif model is not None and hasattr(model, "coef_"):
             explainer = shap.LinearExplainer(model, X_tr, feature_names=feature_names)
             values = explainer.shap_values(X_shap)
             base = _select_base(explainer.expected_value, SHAP_CLASS)
