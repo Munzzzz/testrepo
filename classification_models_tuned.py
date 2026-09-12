@@ -4137,16 +4137,25 @@ def plot_bias_variance_curve(spec, param_name, values, xlabel, n_bootstrap=10,
     plt.close(fig)
 
 
-# KNN: complexity DECREASES as k grows, so the x-axis is inverted to keep the
-# conventional "simple on the left, complex on the right" reading.
-plot_bias_variance_curve(
-    knn, "model__n_neighbors", [v for v in [1, 2, 3, 5, 8, 12, 20, 30, 40] if v <= max_k],
-    xlabel="k  (fewer neighbours = more complex)", invert_x=True)
-
-# Random Forest: complexity increases with depth.
-plot_bias_variance_curve(
-    rf, "model__max_depth", [2, 3, 5, 8, 12, 20, None],
-    xlabel="max_depth  (deeper = more complex)")
+#  These two sweeps name specific models, so they are guarded against a roster
+#  that no longer contains them: Section 0 recommends trimming `models` to
+#  control runtime, and a hardcoded reference here would otherwise fail on an
+#  unfitted spec at the very end of a long run.
+#    KNN: complexity DECREASES as k grows, so the x-axis is inverted to keep the
+#         conventional "simple on the left, complex on the right" reading.
+#    Random Forest: complexity increases with depth.
+_COMPLEXITY_SWEEPS = [
+    (knn, "model__n_neighbors",
+     [v for v in [1, 2, 3, 5, 8, 12, 20, 30, 40] if v <= max_k],
+     "k  (fewer neighbours = more complex)", True),
+    (rf, "model__max_depth", [2, 3, 5, 8, 12, 20, None],
+     "max_depth  (deeper = more complex)", False),
+]
+for _spec, _param, _values, _xlabel, _invert in _COMPLEXITY_SWEEPS:
+    if any(m is _spec for m in bv_models):
+        plot_bias_variance_curve(_spec, _param, _values, xlabel=_xlabel, invert_x=_invert)
+    else:
+        print(f"  complexity sweep skipped: {_spec.name} is not in the current roster.")
 
 
 # =============================================================================
@@ -4592,8 +4601,9 @@ pdp_pairs = list(combinations(top_feats, 2))
 print(f"Plotting {len(pdp_pairs)} two-way interactions.")
 
 #  Trees only by default: 2-way PDP is (rows x grid^2) predictions per pair, so
-#  Keras models and especially ensembles get expensive fast.
-pdp_2way_models = [rf, xgboost_model, lgbm]
+#  Keras models and especially ensembles get expensive fast. Filtered against
+#  the roster for the same reason as the complexity sweeps above.
+pdp_2way_models = [m for m in (rf, xgboost_model, lgbm) if any(x is m for x in models)]
 
 
 def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
