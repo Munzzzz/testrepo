@@ -54,6 +54,16 @@ import pandas as pd
 
 warnings.filterwarnings("ignore")
 
+# `display` is injected by IPython/Colab. The shim keeps the file runnable as a
+# plain script too, so nothing below depends on being inside a notebook.
+try:
+    display
+except NameError:
+    def display(*objs):
+        for o in objs:
+            print(o)
+
+
 SEED = 42
 np.random.seed(SEED)
 
