@@ -2746,88 +2746,124 @@ X_bg   = X_tr[_bg_idx]      # background for the black-box explainer only
 X_shap = X_te[_te_idx]      # rows explained/plotted for every model
 
 # ── BUILD SHAP EXPLANATIONS FOR EACH MODEL ────────────────────────────────────
-explanations = []
+#  Two things here are less obvious than they look, and both are version
+#  sensitive rather than model sensitive:
+#
+#  1. `.shap_values()` is the OLD interface. TreeExplainer and LinearExplainer
+#     still expose it, but the generic `shap.Explainer` dispatches to whatever
+#     algorithm suits the model — Exact, Permutation, Partition — and those
+#     classes only implement `__call__`, so the black-box path must be called
+#     as `explainer(X)` and read `.values` off the Explanation it returns.
+#     Calling `.shap_values()` there raises
+#     `AttributeError: 'ExactExplainer' object has no attribute 'shap_values'`,
+#     which reads like a SHAP bug and is really an API-generation mismatch.
+#     It only bites the non-tree, non-linear models — here the KNN and SVR
+#     Pipelines and the three Keras nets — so it hides until one of those is
+#     in `models`.
+#
+#  2. base_values must be ONE VALUE PER ROW, as an array. shap's Explanation
+#     arithmetic (exp.abs.mean(0), which the bar plot uses) reads
+#     self.base_values.shape, and a bare Python float has no .shape. The
+#     per-row array also keeps the base value aligned when rows are sliced,
+#     which is what the waterfall plot below does.
+#
+#  The whole construction is wrapped per model: an explainer that fails is a
+#  lost diagnostic, not a reason to abort Part 7 after every model has already
+#  been tuned.
+explanations, explained_specs = [], []
 
 for spec in models:
     model = spec.model
     cls = type(model).__name__
+    try:
+        if any(k in cls for k in TREE_KEYS):
+            explainer = shap.TreeExplainer(model, feature_names=feature_names)
+            values = explainer.shap_values(X_shap)
+            base = float(np.ravel(explainer.expected_value)[0])
+        elif hasattr(model, "coef_"):
+            explainer = shap.LinearExplainer(model, X_tr, feature_names=feature_names)
+            values = explainer.shap_values(X_shap)
+            base = float(np.ravel(explainer.expected_value)[0])
+        else:
+            # spec.predict, never model.predict — see the note above.
+            explainer = shap.Explainer(spec.predict, X_bg, feature_names=feature_names)
+            values = explainer(X_shap).values
+            base = float(np.mean(spec.predict(X_bg)))
 
-    if any(k in cls for k in TREE_KEYS):
-        explainer = shap.TreeExplainer(model, feature_names=feature_names)
-    elif hasattr(model, "coef_"):
-        explainer = shap.LinearExplainer(model, X_tr, feature_names=feature_names)
-    else:
-        explainer = shap.Explainer(spec.predict, X_bg, feature_names=feature_names)
+        values = np.asarray(values[0] if isinstance(values, list) else values)
+        if values.ndim == 3:               # (n, f, outputs) -> single output
+            values = values[..., 0]
 
-    shap_values = explainer.shap_values(X_shap)
-    if isinstance(shap_values, list):      # multi-output -> take first
-        shap_values = shap_values[0]
+        explanations.append(shap.Explanation(
+            values        = values,
+            base_values   = np.full(len(values), base, dtype=np.float64),
+            data          = X_shap,
+            feature_names = feature_names))
+        explained_specs.append(spec)
+    except Exception as exc:
+        print(f"  SHAP unavailable for {spec.name}: {type(exc).__name__}: {exc}")
 
-    explanations.append(shap.Explanation(
-        values        = shap_values,
-        base_values   = np.ravel(explainer.expected_value)[0],
-        data          = X_shap,
-        feature_names = feature_names
-    ))
+SHAP_RESULTS = dict(zip((s.name for s in explained_specs), explanations))
 
-SHAP_RESULTS = dict(zip((spec.name for spec in models), explanations))
+
+def _shap_figure(plot_fn, explanation, title, filename):
+    """
+    Render one SHAP figure, failing soft.
+
+    shap's plotting API moves between releases more than any other dependency
+    in this file, and these plots are diagnostics — losing one must not abort
+    the run, least of all in Part 7 after every model has already been tuned.
+    """
+    try:
+        plt.figure()
+        plot_fn(explanation, show=False)
+        plt.title(title, fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        save_fig(plt.gcf(), filename, subdir="shap")
+        plt.show()
+    except Exception as exc:
+        print(f"  SHAP plot skipped ({filename}): {type(exc).__name__}: {exc}")
+    finally:
+        plt.close()
 
 # ── SUMMARY BAR PLOTS ─────────────────────────────────────────────────────────
-for spec, explanation in zip(models, explanations):
-    plt.figure()
-    shap.plots.bar(explanation, show=False)
-    plt.title(f"Feature Importance ({spec.name})", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_fig(plt.gcf(), f"shap_bar_{spec.name.replace(' ', '_')}", subdir="shap")
-    plt.show()
-    plt.close()
+for spec, explanation in zip(explained_specs, explanations):
+    _shap_figure(shap.plots.bar, explanation,
+                 f"Feature Importance ({spec.name})",
+                 f"shap_bar_{spec.name.replace(' ', '_')}")
 
 # ── BEESWARM PLOTS ────────────────────────────────────────────────────────────
-for spec, explanation in zip(models, explanations):
-    plt.figure()
-    shap.plots.beeswarm(explanation, show=False)
-    plt.title(f"SHAP Beeswarm ({spec.name})", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_fig(plt.gcf(), f"shap_beeswarm_{spec.name.replace(' ', '_')}", subdir="shap")
-    plt.show()
-    plt.close()
+for spec, explanation in zip(explained_specs, explanations):
+    _shap_figure(shap.plots.beeswarm, explanation,
+                 f"SHAP Beeswarm ({spec.name})",
+                 f"shap_beeswarm_{spec.name.replace(' ', '_')}")
 
 # ── VIOLIN PLOTS ──────────────────────────────────────────────────────────────
 #  Same global feature-importance information as the beeswarm plots, shown as
 #  a per-feature distribution (violin shape) instead of individual scatter
 #  points — easier to read the overall spread when there are many test rows.
-for spec, explanation in zip(models, explanations):
-    plt.figure()
-    shap.plots.violin(explanation, show=False)
-    plt.title(f"SHAP Violin ({spec.name})", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_fig(plt.gcf(), f"shap_violin_{spec.name.replace(' ', '_')}", subdir="shap")
-    plt.show()
-    plt.close()
+for spec, explanation in zip(explained_specs, explanations):
+    _shap_figure(shap.plots.violin, explanation,
+                 f"SHAP Violin ({spec.name})",
+                 f"shap_violin_{spec.name.replace(' ', '_')}")
 
 # ── WATERFALL PLOTS ───────────────────────────────────────────────────────────
 sample_idx = 0
 
-for spec, explanation in zip(models, explanations):
-    plt.figure()
-    shap.plots.waterfall(explanation[sample_idx], show=False)
-    plt.title(f"SHAP Waterfall ({spec.name})", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_fig(plt.gcf(), f"shap_waterfall_{spec.name.replace(' ', '_')}", subdir="shap")
-    plt.show()
-    plt.close()
+for spec, explanation in zip(explained_specs, explanations):
+    _shap_figure(lambda e, show: shap.plots.waterfall(e[sample_idx], show=show),
+                 explanation,
+                 f"SHAP Waterfall ({spec.name})",
+                 f"shap_waterfall_{spec.name.replace(' ', '_')}")
 
 # ── DEPENDENCE PLOTS ──────────────────────────────────────────────────────────
 feature = feature_names[0]  # Replace with your feature of interest
 
-for spec, explanation in zip(models, explanations):
-    plt.figure()
-    shap.plots.scatter(explanation[:, feature], show=False)
-    plt.title(f"SHAP Dependence ({feature}) — {spec.name}", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_fig(plt.gcf(), f"shap_dependence_{feature}_{spec.name.replace(' ', '_')}", subdir="shap")
-    plt.show()
-    plt.close()
+for spec, explanation in zip(explained_specs, explanations):
+    _shap_figure(lambda e, show: shap.plots.scatter(e[:, feature], show=show),
+                 explanation,
+                 f"SHAP Dependence ({feature}) — {spec.name}",
+                 f"shap_dependence_{_fname(feature)}_{spec.name.replace(' ', '_')}")
 
 
 
