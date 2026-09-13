@@ -407,9 +407,13 @@ def find_best_seed(X_df, y_ser, candidate_seeds=range(1000), test_size=TEST_SIZE
                 .reset_index(drop=True))
     print(f"\nScanned {len(rows)} seeds. Best {top_n} by worst-column KS:")
     print(scores.head(top_n).round(4).to_string(index=False))
-    print(f"\nFor reference, seed=42 -> "
-          f"max_KS={scores.loc[scores.seed == 42, 'max_KS'].iloc[0]:.4f}, "
-          f"mean_KS={scores.loc[scores.seed == 42, 'mean_KS'].iloc[0]:.4f}")
+    #  Guarded: narrowing candidate_seeds to shorten the scan is the obvious way
+    #  to speed this section up, and if the narrowed range excludes 42 this
+    #  reference line would raise IndexError on an empty selection.
+    if (scores['seed'] == 42).any():
+        ref = scores.loc[scores.seed == 42].iloc[0]
+        print(f"\nFor reference, seed=42 -> max_KS={ref['max_KS']:.4f}, "
+              f"mean_KS={ref['mean_KS']:.4f}")
     return int(scores.iloc[0]['seed']), scores
 
 
