@@ -33,8 +33,14 @@ mechanically.
 ### Running it
 
 ```bash
-pip install -U scikit-learn imbalanced-learn xgboost lightgbm optuna tensorflow shap matplotlib seaborn
+pip install -U scikit-learn imbalanced-learn xgboost lightgbm optuna tensorflow shap lime matplotlib seaborn openpyxl
+pip install pysr          # optional — symbolic regression (Section 16)
 ```
+
+`lime` and `pysr` are only needed by the interpretability sections, and both
+degrade cleanly if absent: the workflow prints what is missing and carries on.
+PySR is the one to install deliberately — its first import downloads Julia and
+precompiles a backend, which takes minutes and needs network access.
 
 Then set three things near the top of Section A and run the file top to bottom
 (it is written as a Colab/notebook script, and also runs as a plain script):
@@ -83,8 +89,28 @@ data and switches scorers, curves and averaging conventions accordingly.
    ECE, a decision-threshold sweep, learning curves, a Taylor diagram on the
    predicted probabilities, a Kohavi-Wolpert 0-1 loss bias-variance
    decomposition, and seed sensitivity.
-8. **Factor importance** — SHAP (bar, beeswarm, violin, waterfall, dependence)
-   and ICE / 1-way and 2-way partial dependence.
+8. **Factor importance** — four views, which answer different questions and
+   are worth reading against each other:
+   * **SHAP** (bar, beeswarm, violin, waterfall, dependence) — what the model
+     attributes each prediction to.
+   * **Permutation importance** — what a feature is worth to being *right*,
+     scored on both splits, with a consensus ranking and a Spearman
+     comparison against the SHAP ranking. A feature can rank high on SHAP and
+     near zero here: the model uses it, and the use buys nothing.
+   * **LIME** — why *this* row, with the local surrogate's own R-squared
+     printed beside every explanation, since a LIME plot with a poor local
+     fit is not a weak explanation but no explanation at all.
+   * **ICE / 1-way and 2-way partial dependence** — how the prediction
+     responds as a feature is swept.
+9. **Symbolic regression (PySR)** — searches expression space directly and
+   returns a formula rather than a black box. The whole Pareto front is
+   printed as an aligned ladder (complexity, loss, marginal score, equation),
+   and the selected equation is shown four ways: plain, sympy, LaTeX, and —
+   for classification — as an explicit decision rule. The equation is then
+   scored against the tuned models so the cost of readability is a number.
+   Classification fits the log-odds of the best model by default (`"logit"`,
+   a symbolic surrogate) or the labels directly with a margin loss
+   (`PYSR_TARGET = "label"`); multiclass fits one equation per class.
 
 Figures are written as PNGs and the tables as `results_*.csv`; the target's
 label mapping is written to `target_label_encoding.csv`.

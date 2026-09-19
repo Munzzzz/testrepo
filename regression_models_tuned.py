@@ -47,7 +47,7 @@
 # =============================================================================
 #  SECTION 0 — COMMON SETUP  (run this cell once, before everything else)
 # =============================================================================
-import warnings, time, os, re
+import warnings, time, os, re, textwrap
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -2869,6 +2869,386 @@ for spec, explanation in zip(explained_specs, explanations):
 
 
 # =============================================================================
+#  SECTION 9B — PERMUTATION IMPORTANCE
+# =============================================================================
+#  The second view of feature importance in Part 7, and the bluntest question
+#  of the three: if this feature were pure noise, how much worse would the
+#  model be? Shuffle one column, re-score, and the drop IS the importance.
+#
+#  It answers something SHAP does not. SHAP attributes the predictions the
+#  model actually makes, so it explains the model's BEHAVIOUR: a feature the
+#  model leans on heavily gets a large attribution whether or not that
+#  reliance helps. Permutation importance scores against the TRUTH, so it
+#  measures how much a feature contributes to being RIGHT. A feature can rank
+#  high on SHAP and near zero here — the model uses it, and the use buys
+#  nothing. The rank comparison at the end of this section is where that
+#  disagreement surfaces, and a disagreement is a finding, not an error.
+#
+#  Both splits are computed. Train-set permutation measures how much a feature
+#  was used to FIT; test-set permutation measures how much it carries to
+#  unseen data, which is almost always the question being asked. The gap
+#  between them is itself diagnostic: a feature that matters a lot on train
+#  and nothing on test was memorised, not learned.
+#
+#  THE CORRELATION CAVEAT — the same one the PDP section carries, for the same
+#  reason. Shuffling one column of a mix design produces rows that are
+#  physically impossible (cement from one mix, water from another, violating
+#  the unit-volume and w/b constraints), and the model is then scored on them.
+#  Worse, with two strongly correlated features each can be shuffled with
+#  little damage because the other still carries the signal, so BOTH look
+#  unimportant and the pair's real contribution goes unreported. Read the
+#  correlation heatmaps from Part 3 alongside this, and treat a low score for
+#  a feature that has a highly correlated partner as "not UNIQUELY important"
+#  rather than "not important".
+#
+#  Cost is (n_features x n_repeats + 1) predictions per model. Nothing is
+#  refitted, so this scales with the roster rather than with training.
+# =============================================================================
+PERM_N_REPEATS = 10          # shuffles per feature; more repeats = tighter error bars
+PERM_MODELS    = models      # use all_models to also cover the Section 4B ensembles
+
+
+def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED):
+    """
+    Model-agnostic permutation importance for one already-fitted ModelSpec.
+
+    Written against spec.predict rather than sklearn's permutation_importance
+    so the Keras nets and the Section 4B ensembles — neither of which is an
+    sklearn estimator — travel exactly the same code path as the trees.
+
+    Returns (baseline_r2, drops), where drops has shape (n_features, n_repeats)
+    and every entry is baseline - R2_after_shuffling. Positive means the model
+    got worse without the feature, i.e. the feature was carrying something.
+    """
+    rng = np.random.RandomState(seed)
+    X = np.array(X, dtype=np.float64, copy=True)    # never mutate the caller's array
+    baseline = r2_score(y, spec.predict(X))
+    drops = np.empty((X.shape[1], n_repeats), dtype=np.float64)
+    for j in range(X.shape[1]):
+        original = X[:, j].copy()
+        for r in range(n_repeats):
+            X[:, j] = rng.permutation(original)
+            drops[j, r] = baseline - r2_score(y, spec.predict(X))
+        X[:, j] = original                          # restore before the next column
+    return baseline, drops
+
+
+def compute_permutation_importance(specs=PERM_MODELS):
+    """Run the permutation for every spec on both splits; returns a long frame."""
+    rows, store = [], {}
+    for spec in specs:
+        for split, (Xs, ys) in (("test", (X_te, y_te)), ("train", (X_tr, y_tr))):
+            baseline, drops = permutation_importance_spec(spec, Xs, ys)
+            store[(spec.name, split)] = (baseline, drops)
+            order = np.argsort(drops.mean(axis=1))[::-1]
+            rank = np.empty(len(order), dtype=int)
+            rank[order] = np.arange(1, len(order) + 1)
+            for j, feat in enumerate(feature_names):
+                rows.append({"Model": spec.name, "Split": split, "Feature": feat,
+                             "Baseline R2": baseline,
+                             "Mean drop": drops[j].mean(), "Std": drops[j].std(),
+                             "Rank": int(rank[j])})
+        print(f"  {spec.name:32s} baseline R2  "
+              f"test={store[(spec.name,'test')][0]:.4f}  "
+              f"train={store[(spec.name,'train')][0]:.4f}")
+    return pd.DataFrame(rows), store
+
+
+print("\n" + "=" * 78)
+print(f"PERMUTATION IMPORTANCE  ({PERM_N_REPEATS} shuffles per feature)")
+print("=" * 78)
+perm_df, PERM_RESULTS = compute_permutation_importance()
+register_table("Permutation importance", perm_df)
+
+
+# ── PER-MODEL BAR CHARTS (mean drop +/- std over the repeats) ─────────────────
+def plot_permutation_importance(specs=PERM_MODELS, split="test"):
+    for spec in specs:
+        baseline, drops = PERM_RESULTS[(spec.name, split)]
+        means, stds = drops.mean(axis=1), drops.std(axis=1)
+        order = np.argsort(means)                    # ascending: biggest at the top
+        fig, ax = plt.subplots(figsize=(7.2, max(3.0, 0.42 * len(order) + 1.4)))
+        ax.barh([feature_names[i] for i in order], means[order],
+                xerr=stds[order], color=COLORS[spec.name], edgecolor='black',
+                linewidth=0.6, error_kw=dict(ecolor='black', lw=1.0, capsize=3))
+        ax.axvline(0, color='black', linewidth=0.9)
+        ax.set_xlabel("Drop in $R^2$ when the feature is shuffled")
+        ax.set_title(f"Permutation Importance — {spec.name}  ({split}, "
+                     f"baseline $R^2$ = {baseline:.3f})",
+                     fontsize=12, fontweight='bold')
+        ax.grid(axis='x', color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+        fig.tight_layout()
+        save_fig(fig, f"permutation_{_fname(spec.name)}_{split}",
+                 subdir="permutation/per_model")
+        plt.show()
+        plt.close(fig)
+
+
+plot_permutation_importance(split="test")
+
+# ── CONSENSUS ACROSS MODELS ──────────────────────────────────────────────────
+#  One model's ranking is one model's opinion. Averaging the mean drop across
+#  the roster is the closest thing to a model-independent statement the data
+#  supports, and the spread across models says how much to trust it.
+_perm_test = perm_df[perm_df.Split == "test"]
+perm_consensus = (_perm_test.groupby("Feature")["Mean drop"]
+                  .agg(["mean", "std", "min", "max"])
+                  .sort_values("mean", ascending=False)
+                  .rename(columns={"mean": "Mean drop (across models)",
+                                   "std": "Std across models",
+                                   "min": "Min", "max": "Max"}))
+print("\nConsensus permutation importance (test, averaged over the roster):")
+display(perm_consensus.round(4))
+register_table("Permutation consensus", perm_consensus, index=True)
+
+fig, ax = plt.subplots(figsize=(7.6, max(3.0, 0.45 * len(perm_consensus) + 1.4)))
+_c = perm_consensus.iloc[::-1]
+ax.barh(_c.index, _c["Mean drop (across models)"],
+        xerr=_c["Std across models"].fillna(0.0), color='#0072B2',
+        edgecolor='black', linewidth=0.6,
+        error_kw=dict(ecolor='black', lw=1.0, capsize=3))
+ax.axvline(0, color='black', linewidth=0.9)
+ax.set_xlabel("Mean drop in $R^2$ (averaged across models)")
+ax.set_title(f"Permutation Importance — consensus over {len(PERM_MODELS)} models",
+             fontsize=12, fontweight='bold')
+ax.grid(axis='x', color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+fig.tight_layout()
+save_fig(fig, "permutation_consensus", subdir="permutation")
+plt.show()
+plt.close(fig)
+
+# ── TRAIN vs TEST (memorised or learned?) ────────────────────────────────────
+_perm_gap = (perm_df.pivot_table(index="Feature", columns="Split",
+                                 values="Mean drop", aggfunc="mean")
+             .rename(columns={"train": "Mean drop (train)",
+                              "test": "Mean drop (test)"}))
+_perm_gap["Train - Test"] = _perm_gap["Mean drop (train)"] - _perm_gap["Mean drop (test)"]
+_perm_gap = _perm_gap.sort_values("Train - Test", ascending=False)
+print("\nTrain vs test permutation importance — a large positive gap means the "
+      "feature\nwas used to fit and did not carry to unseen data:")
+display(_perm_gap.round(4))
+register_table("Permutation train vs test", _perm_gap, index=True)
+
+# ── PERMUTATION vs SHAP: do the two rankings agree? ──────────────────────────
+#  Spearman over the ranks, per model. High agreement means the model's
+#  reliance and the feature's usefulness point the same way. Low agreement is
+#  the interesting case and is worth reading feature by feature.
+def compare_shap_and_permutation():
+    if not SHAP_RESULTS:
+        print("\nNo SHAP results to compare against — skipping.")
+        return None
+    rows = []
+    for spec in PERM_MODELS:
+        exp = SHAP_RESULTS.get(spec.name)
+        if exp is None:
+            continue
+        shap_imp = np.abs(exp.values).mean(axis=0)
+        perm_imp = PERM_RESULTS[(spec.name, "test")][1].mean(axis=1)
+        if len(shap_imp) != len(perm_imp):
+            continue
+        rho, pval = st_spearmanr(shap_imp, perm_imp)
+        rows.append({"Model": spec.name, "Spearman rho": rho, "p-value": pval,
+                     "SHAP top feature": feature_names[int(np.argmax(shap_imp))],
+                     "Permutation top feature": feature_names[int(np.argmax(perm_imp))]})
+    if not rows:
+        print("\nNo model has both SHAP and permutation results — skipping.")
+        return None
+    out = pd.DataFrame(rows)
+    print("\nDo SHAP and permutation importance rank the features the same way?")
+    display(out.round(4))
+    register_table("SHAP vs permutation", out)
+    return out
+
+
+shap_vs_perm = compare_shap_and_permutation()
+
+
+# =============================================================================
+#  SECTION 9C — LIME  (Local Interpretable Model-agnostic Explanations)
+# =============================================================================
+#  pip install lime
+#
+#  The third view in Part 7, and the only LOCAL one. SHAP and permutation
+#  importance both answer "which features matter?" over a whole dataset. LIME
+#  answers "why THIS prediction?" — it perturbs a single row, watches how the
+#  model's output moves, and fits a small weighted linear model to that local
+#  neighbourhood. The coefficients of that little model are the explanation.
+#
+#  Why keep it when SHAP is already here. They are not the same calculation
+#  dressed differently: SHAP's local explanations sum exactly to the
+#  prediction (the efficiency axiom), LIME's do not and make no such promise.
+#  What LIME gives instead is a readable IF-THEN reading of the neighbourhood
+#  — "0.46 < cement <= 0.73 pushed this prediction up by 4.2" — because it
+#  discretises the features into bins first. Practitioners find that phrasing
+#  easier to argue with, and arguing with an explanation is the point.
+#
+#  READ exp.score BEFORE YOU BELIEVE ANY OF IT. That is the local surrogate's
+#  own R-squared: how well the little linear model reproduces the real model
+#  in that neighbourhood. It is reported for every explanation below, and it
+#  is often mediocre. A LIME explanation with a local R-squared of 0.15 is not
+#  a weak explanation, it is not an explanation at all — the linear surrogate
+#  simply does not describe the model there, and the weights are noise. This
+#  is the most common way LIME is misread, so the number is printed next to
+#  every single plot rather than buried.
+#
+#  WHICH ROWS. Explaining row 0 is a habit, not a choice, and row 0 is rarely
+#  interesting. The rows picked here are the ones worth looking at: the
+#  median-error case (typical behaviour), and the largest over- and
+#  under-prediction (where the model fails, which is where an explanation
+#  earns its keep).
+# =============================================================================
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+    LIME_AVAILABLE = True
+except ImportError:
+    LIME_AVAILABLE = False
+    print("lime is not installed — skipping Section 9C.  pip install lime")
+
+LIME_MODELS      = models[:3]   # local explanations are per-row; keep the roster small
+LIME_N_FEATURES  = min(8, N_FEATURES)
+LIME_NUM_SAMPLES = 5000         # perturbations drawn per explanation
+
+
+def select_instances_to_explain(spec, X, y, k_extreme=1):
+    """
+    Rows worth explaining: the typical case and the failures.
+
+    Returns [(index, label), ...] — the median absolute residual, then the
+    k_extreme largest over-predictions and under-predictions.
+    """
+    resid = np.asarray(y).ravel() - spec.predict(X)
+    order = np.argsort(np.abs(resid))
+    picks = [(int(order[len(order) // 2]), "median error")]
+    for i in np.argsort(resid)[:k_extreme]:          # most negative -> over-predicted
+        picks.append((int(i), "worst over-prediction"))
+    for i in np.argsort(resid)[::-1][:k_extreme]:    # most positive -> under-predicted
+        picks.append((int(i), "worst under-prediction"))
+    seen, unique = set(), []
+    for idx, label in picks:                          # a tiny test set can collide
+        if idx not in seen:
+            seen.add(idx)
+            unique.append((idx, label))
+    return unique
+
+
+def explain_one(explainer, spec, row, idx, label):
+    """One LIME explanation, rendered and tabulated. Returns rows for the table."""
+    exp = explainer.explain_instance(
+        np.asarray(row, dtype=np.float64), spec.predict,
+        num_features=LIME_N_FEATURES, num_samples=LIME_NUM_SAMPLES)
+    pairs = exp.as_list()
+    actual = float(np.asarray(y_te).ravel()[idx])
+    predicted = float(spec.predict(row.reshape(1, -1))[0])
+    local_pred = float(np.ravel(exp.local_pred)[0])
+    intercept = float(exp.intercept[1])
+
+    conditions = [c for c, _ in pairs][::-1]
+    weights = np.array([w for _, w in pairs])[::-1]
+    fig, ax = plt.subplots(figsize=(8.2, max(2.8, 0.44 * len(pairs) + 1.6)))
+    ax.barh(conditions, weights,
+            color=['#D55E00' if w < 0 else '#009E73' for w in weights],
+            edgecolor='black', linewidth=0.6)
+    ax.axvline(0, color='black', linewidth=0.9)
+    ax.set_xlabel("Local weight (effect on this one prediction)")
+    ax.set_title(f"LIME — {spec.name}\nrow {idx} ({label}):  actual = {actual:.3f},  "
+                 f"model = {predicted:.3f}\nlocal surrogate $R^2$ = {exp.score:.3f}",
+                 fontsize=11, fontweight='bold')
+    ax.grid(axis='x', color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+    save_fig(fig, f"lime_{_fname(spec.name)}_row{idx}_{_slug(label)}",
+             subdir="lime/per_instance")
+    plt.show()
+    plt.close(fig)
+
+    print(f"\n  {spec.name} — row {idx} ({label})")
+    print(f"    actual = {actual:.4f}   model = {predicted:.4f}   "
+          f"local surrogate = {local_pred:.4f}")
+    print(f"    local R2 = {exp.score:.4f}   intercept = {intercept:.4f}"
+          + ("   << surrogate does not fit here; treat the weights as unreliable"
+             if exp.score < 0.3 else ""))
+    for cond, w in pairs:
+        print(f"      {w:+9.4f}   {cond}")
+
+    return [{"Model": spec.name, "Row": idx, "Case": label,
+             "Actual": actual, "Predicted": predicted,
+             "Local surrogate pred": local_pred, "Local R2": float(exp.score),
+             "Intercept": intercept, "Condition": cond, "Weight": w}
+            for cond, w in pairs]
+
+
+if LIME_AVAILABLE:
+    print("\n" + "=" * 78)
+    print("LIME — LOCAL EXPLANATIONS")
+    print("=" * 78)
+
+    #  The explainer is built on the TRAINING data: that is the distribution
+    #  the perturbations are drawn from and the bins are cut from. Building it
+    #  on the test set would explain each row against a neighbourhood the
+    #  model never saw.
+    lime_explainer = LimeTabularExplainer(
+        training_data   = np.asarray(X_tr, dtype=np.float64),
+        training_labels = np.asarray(y_tr, dtype=np.float64).ravel(),
+        feature_names   = list(feature_names),
+        mode            = "regression",
+        discretize_continuous = True,
+        random_state    = SEED,
+    )
+
+    lime_rows = []
+    for spec in LIME_MODELS:
+        for idx, label in select_instances_to_explain(spec, X_te, y_te):
+            try:
+                lime_rows += explain_one(lime_explainer, spec,
+                                         np.asarray(X_te, dtype=np.float64)[idx],
+                                         idx, label)
+            except Exception as exc:
+                print(f"  LIME failed for {spec.name} row {idx}: "
+                      f"{type(exc).__name__}: {exc}")
+
+    if lime_rows:
+        lime_df = pd.DataFrame(lime_rows)
+        register_table("LIME local weights", lime_df)
+
+        #  GLOBAL FROM LOCAL. Averaging |weight| per feature over many explained
+        #  rows turns the local method into a global ranking that can be put
+        #  next to SHAP and permutation importance. It is a weaker statement
+        #  than either — it is an average of local linear fits, several of
+        #  which may have had a poor local R2 — so the mean local R2 behind
+        #  each figure is carried alongside it rather than dropped.
+        def feature_of(condition):
+            """Recover the feature name from a LIME condition like '2.1 < age <= 8'."""
+            hits = [f for f in feature_names if f in condition]
+            return max(hits, key=len) if hits else condition
+
+        lime_df["Feature"] = lime_df["Condition"].map(feature_of)
+        lime_global = (lime_df.assign(AbsWeight=lime_df["Weight"].abs())
+                       .groupby("Feature")
+                       .agg(**{"Mean |weight|": ("AbsWeight", "mean"),
+                               "Std": ("AbsWeight", "std"),
+                               "Explanations": ("AbsWeight", "size"),
+                               "Mean local R2": ("Local R2", "mean")})
+                       .sort_values("Mean |weight|", ascending=False))
+        print("\nGlobal-from-local importance (mean |LIME weight| over "
+              f"{lime_df[['Model', 'Row']].drop_duplicates().shape[0]} explanations):")
+        display(lime_global.round(4))
+        register_table("LIME global from local", lime_global, index=True)
+
+        fig, ax = plt.subplots(figsize=(7.6, max(3.0, 0.45 * len(lime_global) + 1.4)))
+        _g = lime_global.iloc[::-1]
+        ax.barh(_g.index, _g["Mean |weight|"], xerr=_g["Std"].fillna(0.0),
+                color='#CC79A7', edgecolor='black', linewidth=0.6,
+                error_kw=dict(ecolor='black', lw=1.0, capsize=3))
+        ax.set_xlabel("Mean |LIME weight| across explained rows")
+        ax.set_title("LIME — global importance aggregated from local explanations",
+                     fontsize=12, fontweight='bold')
+        ax.grid(axis='x', color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+        fig.tight_layout()
+        save_fig(fig, "lime_global_from_local", subdir="lime")
+        plt.show()
+        plt.close(fig)
+
+
+# =============================================================================
 #  SECTION 14 — ICE & PARTIAL DEPENDENCE PLOTS
 # =============================================================================
 #  Model-agnostic interpretability, sitting alongside SHAP in Part 7. SHAP
@@ -3188,6 +3568,371 @@ def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
 
 
 plot_pdp_2way(pdp_2way_models, X_pdp_2way)
+
+
+# =============================================================================
+#  SECTION 16 — PySR  (SYMBOLIC REGRESSION: AN EQUATION, NOT A BLACK BOX)
+# =============================================================================
+#  pip install pysr
+#
+#  Everything above this point explains a model after the fact — SHAP,
+#  permutation, LIME and PDP all take a fitted black box and interrogate it.
+#  Symbolic regression skips that step: it searches the space of algebraic
+#  expressions directly and returns a formula you can read, publish,
+#  differentiate, and check against physics. For a mix-design problem that is
+#  not a novelty, it is the deliverable — a closed-form strength model sits in
+#  a paper in a way a 600-tree forest never will.
+#
+#  WHAT PySR ACTUALLY RETURNS. Not one equation: a PARETO FRONT. Genetic
+#  search evolves a population of expression trees and keeps, for every
+#  complexity level, the best-scoring expression at that complexity. So the
+#  output is a ladder from `y = c` up to something long and accurate, and
+#  choosing a rung is a modelling decision rather than a numerical one. The
+#  whole front is printed below, not just the winner, because the interesting
+#  equation is usually two or three rungs BELOW the most accurate one — where
+#  the loss has stopped improving much but the formula still fits on a line.
+#  `score` in that table is the marginal value of complexity: the drop in
+#  log-loss per unit of extra complexity at that rung. A big score is a rung
+#  that paid for itself.
+#
+#  THE JULIA BACKEND. PySR is a Python wrapper over SymbolicRegression.jl, so
+#  the first `import pysr` in a fresh environment downloads Julia and
+#  precompiles the backend. That takes minutes and needs network access, which
+#  is why the import is inside the guard below rather than at the top of the
+#  file: an environment without it should skip this section, not fail at
+#  import time three hours into a run.
+#
+#  REPRODUCIBILITY. PySR is only deterministic with BOTH `deterministic=True`
+#  AND `parallelism="serial"` AND a fixed `random_state` — it raises if you
+#  ask for the first without the second, and merely warns if you set the seed
+#  without either, which is the trap: a seeded-looking search that still
+#  wanders between runs. PYSR_DETERMINISTIC below sets all three together.
+#  Serial search is materially slower, so it is off by default and on when the
+#  number has to be quotable.
+#
+#  COST. Roughly niterations x populations x population_size expression
+#  evaluations. The defaults here are a working budget, not a publication
+#  budget; PYSR_TIMEOUT caps the wall clock either way.
+# =============================================================================
+PYSR_ENABLED       = True      # set False to skip this section entirely
+PYSR_NITERATIONS   = 40        # search iterations; the main quality/time knob
+PYSR_POPULATIONS   = 15
+PYSR_POPULATION_SZ = 33
+PYSR_MAXSIZE       = 25        # largest expression the search may build
+PYSR_TIMEOUT       = 300       # seconds; None for no cap
+PYSR_DETERMINISTIC = False     # True -> serial + seeded + reproducible (slower)
+PYSR_TOP_ROWS      = 15        # rungs of the Pareto front to print
+
+#  Operators. Keep the set small and physically sensible: every operator added
+#  multiplies the search space, and `exp` on unscaled mix quantities overflows
+#  happily. The *_abs variants are the protected forms — sqrt_abs and log_abs
+#  cannot produce NaN on negative arguments, which otherwise poisons a whole
+#  population.
+PYSR_BINARY_OPS = ["+", "-", "*", "/"]
+PYSR_UNARY_OPS  = ["square", "sqrt_abs", "log_abs"]
+
+
+#  ── FEATURE NAMES PySR WILL ACCEPT ───────────────────────────────────────────
+#  PySR validates variable names against ^[a-zA-Z0-9_]+$ and additionally
+#  rejects anything that collides with a sympy function or one of its own
+#  operator names. That is stricter than it sounds: a column called 'w/b'
+#  raises "Invalid variable name", and so would 'max', 'abs', 'sign', 're' or
+#  'beta'. Renaming is therefore not optional, and a silent rename would be
+#  worse than the crash — so the mapping is printed whenever one happens, and
+#  the equations are shown with the safe names so they stay copy-pasteable.
+_PYSR_RESERVED = {
+    "div", "inv", "mult", "sqrt", "sqrt_abs", "cbrt", "square", "cube", "plus",
+    "sub", "neg", "pow", "pow_abs", "cos", "sin", "tan", "cosh", "sinh", "tanh",
+    "exp", "acos", "asin", "atan", "acosh", "acosh_abs", "asinh", "atanh",
+    "atanh_clip", "abs", "mod", "erf", "erfc", "log", "log10", "log2", "log1p",
+    "log_abs", "log10_abs", "log2_abs", "log1p_abs", "floor", "ceil", "sign",
+    "gamma", "round", "max", "min", "greater", "less", "greater_equal",
+    "less_equal", "cond", "logical_or", "logical_and", "relu", "fma", "muladd",
+    "clamp",
+}
+
+
+def pysr_safe_names(names):
+    """
+    Map feature names to ones PySR accepts. Returns (safe_names, renamed_dict).
+
+    Non-alphanumerics become underscores, a leading digit gets an 'x' prefix,
+    collisions with sympy/PySR function names get a trailing underscore, and
+    any duplicate produced by that mangling is numbered so the mapping stays
+    one-to-one.
+    """
+    import sympy
+    safe, seen, renamed = [], set(), {}
+    for original in names:
+        name = re.sub(r"[^0-9a-zA-Z_]", "_", str(original)).strip("_")
+        if not name or name[0].isdigit():
+            name = "x_" + name
+        while name in _PYSR_RESERVED or hasattr(sympy, name):
+            name += "_"
+        base, n = name, 2
+        while name in seen:
+            name, n = f"{base}_{n}", n + 1
+        seen.add(name)
+        safe.append(name)
+        if name != str(original):
+            renamed[name] = str(original)
+    return safe, renamed
+
+
+#  Equations are the point of this section, so the front is laid out as a real
+#  table: the numbers in fixed columns and the expression starting at a fixed
+#  offset, wrapping onto a hanging indent when it is too long for one line.
+#  Printing the equation on its own line under the numbers (the obvious first
+#  attempt) destroys the column alignment and makes two rungs impossible to
+#  compare at a glance, which is the one thing this table exists for.
+def _equation_row(mark, complexity, loss, score, equation, width=78):
+    """
+    One Pareto-front row: fixed numeric columns, equation hanging-indented.
+
+    The continuation indent is measured from the row's own prefix rather than
+    written as a constant, so it stays aligned even when a loss value renders
+    wider than its column — a hardcoded offset drifts by a character the first
+    time that happens, and a misaligned wrap is exactly as hard to read as no
+    wrap at all.
+    """
+    head = f"{mark:2s} {complexity:>4d} {loss:>11.5g} {score:>7.4f}  "
+    body = textwrap.wrap(str(equation), width=max(24, width - len(head)),
+                         break_long_words=False, break_on_hyphens=False) or [""]
+    return "\n".join([head + body[0]] + [" " * len(head) + b for b in body[1:]])
+
+
+def _wrap_equation(text, indent=8, width=78):
+    """Wrap a long equation on its spaces so no token is ever split."""
+    return textwrap.fill(str(text), width=width,
+                         initial_indent=" " * indent,
+                         subsequent_indent=" " * (indent + 4),
+                         break_long_words=False, break_on_hyphens=False)
+
+
+def print_pareto_front(model, title, top=PYSR_TOP_ROWS):
+    """
+    Print the Pareto front as a readable ladder, simplest rung first.
+
+    This is the part of a PySR run that is worth reading, and its default
+    repr is wide enough to wrap badly in a notebook, so it is reformatted
+    here: fixed-width columns, the equation last so it can run long, and a
+    marker on the rung `model_selection` actually chose.
+    """
+    eqs = model.equations_
+    if isinstance(eqs, list):                 # multi-output; this file is single
+        eqs = eqs[0]
+    chosen = model.get_best()
+    chosen_complexity = int(chosen["complexity"])
+
+    shown = eqs.tail(top) if len(eqs) > top else eqs
+    print("\n" + "=" * 78)
+    print(title)
+    print("=" * 78)
+    print(f"{'':2s} {'cplx':>4s} {'loss':>11s} {'score':>7s}  equation")
+    print("-" * 78)
+    for _, row in shown.iterrows():
+        mark = ">>" if int(row["complexity"]) == chosen_complexity else "  "
+        score = row["score"] if "score" in row else float("nan")
+        print(_equation_row(mark, int(row["complexity"]), float(row["loss"]),
+                            float(score), row["equation"]))
+    print("-" * 78)
+    print(f">> marks the rung chosen by model_selection='{model.model_selection}'.")
+    print("   `score` is the drop in log-loss per unit of added complexity — a "
+          "high\n   score means that rung paid for the extra terms.")
+    return eqs, chosen
+
+
+def print_chosen_equation(model, chosen, target_name, renamed):
+    """The selected equation, four ways: plain, sympy, LaTeX, and callable."""
+    print("\n" + "=" * 78)
+    print(f"SELECTED EQUATION   (complexity {int(chosen['complexity'])}, "
+          f"loss {chosen['loss']:.6g})")
+    print("=" * 78)
+    print(f"\n  {target_name} =")
+    print(_wrap_equation(chosen["equation"], indent=6))
+
+    try:
+        print("\n  sympy (simplified):")
+        print(_wrap_equation(model.sympy(), indent=6))
+    except Exception as exc:
+        print(f"    sympy form unavailable: {type(exc).__name__}: {exc}")
+
+    try:
+        print("\n  LaTeX (paste straight into a paper):")
+        print(_wrap_equation(f"{target_name} = {model.latex(precision=4)}", indent=6))
+    except Exception as exc:
+        print(f"    LaTeX form unavailable: {type(exc).__name__}: {exc}")
+
+    if renamed:
+        print("\n  Renamed for PySR (it rejects non-alphanumeric and "
+              "function-name variables):")
+        for safe, original in renamed.items():
+            print(f"      {safe:>20s}  <-  {original}")
+    print("\n" + "=" * 78)
+
+
+def plot_pareto_front(eqs, chosen, title, filename):
+    """Loss against complexity, with the selected rung marked."""
+    fig, ax = plt.subplots(figsize=(7.4, 5.0))
+    ax.plot(eqs["complexity"], eqs["loss"], marker='o', color='#0072B2',
+            linewidth=1.8, markersize=5, label="Pareto front")
+    ax.scatter([chosen["complexity"]], [chosen["loss"]], s=170, marker='*',
+               color='#D55E00', zorder=5, edgecolor='black', linewidth=0.7,
+               label=f"selected (complexity {int(chosen['complexity'])})")
+    ax.set_yscale("log")
+    ax.set_xlabel("Complexity (number of nodes in the expression tree)")
+    ax.set_ylabel("Loss (log scale)")
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    save_fig(fig, filename, subdir="pysr")
+    plt.show()
+    plt.close(fig)
+
+
+if PYSR_ENABLED:
+    try:
+        from pysr import PySRRegressor
+        PYSR_AVAILABLE = True
+    except Exception as exc:
+        PYSR_AVAILABLE = False
+        print(f"PySR unavailable ({type(exc).__name__}: {exc}).\n"
+              "  pip install pysr   — note the first import also downloads "
+              "Julia and precompiles\n  the backend, which needs network "
+              "access and a few minutes.")
+else:
+    PYSR_AVAILABLE = False
+    print("PYSR_ENABLED is False — skipping Section 16.")
+
+
+if PYSR_AVAILABLE:
+    pysr_names, pysr_renamed = pysr_safe_names(feature_names)
+    X_sym_tr = pd.DataFrame(np.asarray(X_tr, dtype=np.float64), columns=pysr_names)
+    X_sym_te = pd.DataFrame(np.asarray(X_te, dtype=np.float64), columns=pysr_names)
+
+    if pysr_renamed:
+        print("Renamed for PySR:  "
+              + ",  ".join(f"{o} -> {s}" for s, o in pysr_renamed.items()))
+
+    _parallelism = "serial" if PYSR_DETERMINISTIC else "multithreading"
+    print(f"\nSearching for an equation for {TARGET_COL} "
+          f"({PYSR_NITERATIONS} iterations, {_parallelism}"
+          + (f", {PYSR_TIMEOUT}s cap" if PYSR_TIMEOUT else "") + ") ...")
+
+    pysr_model = PySRRegressor(
+        niterations      = PYSR_NITERATIONS,
+        populations      = PYSR_POPULATIONS,
+        population_size  = PYSR_POPULATION_SZ,
+        maxsize          = PYSR_MAXSIZE,
+        binary_operators = PYSR_BINARY_OPS,
+        unary_operators  = PYSR_UNARY_OPS,
+        elementwise_loss = "L2DistLoss()",        # plain squared error
+        model_selection  = "best",                # accuracy/complexity trade-off
+        timeout_in_seconds = PYSR_TIMEOUT,
+        parallelism      = _parallelism,
+        deterministic    = PYSR_DETERMINISTIC,
+        random_state     = SEED if PYSR_DETERMINISTIC else None,
+        progress         = False,                 # tidy output in a notebook
+        verbosity        = 0,
+        temp_equation_file = True,                # no stray files in the cwd
+    )
+
+    _t0 = time.time()
+    pysr_model.fit(X_sym_tr, np.asarray(y_tr, dtype=np.float64).ravel())
+    print(f"Search finished in {time.time() - _t0:.1f}s.")
+
+    pysr_eqs, pysr_best = print_pareto_front(
+        pysr_model, f"PySR PARETO FRONT — every rung from constant to complex")
+    print_chosen_equation(pysr_model, pysr_best, TARGET_COL, pysr_renamed)
+
+    # ── HOW GOOD IS THE EQUATION, NEXT TO THE BLACK BOXES? ───────────────────
+    #  The whole point is to know what readability costs. If the formula is
+    #  within a couple of RMSE points of the best tuned model, that is the
+    #  result worth reporting.
+    _sym_tr = pysr_model.predict(X_sym_tr)
+    _sym_te = pysr_model.predict(X_sym_te)
+    pysr_metrics = pd.DataFrame([
+        {"Split": "train",
+         "RMSE": float(np.sqrt(mean_squared_error(y_tr, _sym_tr))),
+         "MAE":  float(mean_absolute_error(y_tr, _sym_tr)),
+         "R2":   float(r2_score(y_tr, _sym_tr))},
+        {"Split": "test",
+         "RMSE": float(np.sqrt(mean_squared_error(y_te, _sym_te))),
+         "MAE":  float(mean_absolute_error(y_te, _sym_te)),
+         "R2":   float(r2_score(y_te, _sym_te))},
+    ])
+    print("\nSymbolic model performance:")
+    display(pysr_metrics.round(4))
+
+    _bench = summary_table()[["RMSE", "R2"]].copy()
+    _bench.loc["PySR (symbolic)"] = [pysr_metrics.loc[1, "RMSE"],
+                                     pysr_metrics.loc[1, "R2"]]
+    _bench = _bench.sort_values("RMSE")
+    print("\nWhere the equation lands against the tuned models (test RMSE):")
+    display(_bench.round(4))
+
+    # ── TABLES + FIGURES ─────────────────────────────────────────────────────
+    _front = pysr_eqs[["complexity", "loss", "equation"]].copy()
+    if "score" in pysr_eqs.columns:
+        _front["score"] = pysr_eqs["score"]
+    _front["selected"] = (_front["complexity"].astype(int)
+                          == int(pysr_best["complexity"]))
+    register_table("PySR Pareto front", _front)
+    register_table("PySR metrics", pysr_metrics)
+    register_table("PySR vs models", _bench, index=True)
+    if pysr_renamed:
+        register_table("PySR variable names", pd.DataFrame(
+            [{"PySR name": s, "Original feature": o}
+             for s, o in pysr_renamed.items()]))
+
+    plot_pareto_front(pysr_eqs, pysr_best,
+                      "PySR Pareto Front — accuracy against complexity",
+                      "pysr_pareto_front")
+
+    #  Predicted vs actual for the equation alone, on the same axes style as
+    #  Section 8 so the two can be compared directly.
+    fig, axes = plt.subplots(1, 2, figsize=(11.5, 5.2))
+    for ax, (split, yt, yp) in zip(axes, (("train", y_tr, _sym_tr),
+                                          ("test", y_te, _sym_te))):
+        yt = np.asarray(yt).ravel()
+        lo, hi = float(min(yt.min(), yp.min())), float(max(yt.max(), yp.max()))
+        ax.scatter(yt, yp, s=26, alpha=0.65, color='#0072B2', edgecolor='none')
+        ax.plot([lo, hi], [lo, hi], color='black', linestyle='--', linewidth=1.2)
+        ax.set_xlabel(f"Actual {TARGET_COL}")
+        ax.set_ylabel(f"Predicted {TARGET_COL}")
+        ax.set_title(f"PySR equation — {split}  "
+                     f"($R^2$ = {r2_score(yt, yp):.3f})",
+                     fontsize=12, fontweight='bold')
+        ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+    fig.tight_layout()
+    save_fig(fig, "pysr_actual_vs_predicted", subdir="pysr")
+    plt.show()
+    plt.close(fig)
+
+    #  Every rung as its own figure: the point of a Pareto front is to choose
+    #  from it, and comparing rungs is much easier side by side than in a list.
+    if PER_ITEM_FIGURES:
+        for _, row in pysr_eqs.iterrows():
+            try:
+                pred = pysr_model.predict(X_sym_te, index=int(row.name))
+            except Exception:
+                continue
+            fig, ax = plt.subplots(figsize=(5.6, 5.2))
+            yt = np.asarray(y_te).ravel()
+            lo, hi = float(min(yt.min(), pred.min())), float(max(yt.max(), pred.max()))
+            ax.scatter(yt, pred, s=24, alpha=0.65, color='#009E73', edgecolor='none')
+            ax.plot([lo, hi], [lo, hi], color='black', linestyle='--', linewidth=1.1)
+            ax.set_xlabel(f"Actual {TARGET_COL}")
+            ax.set_ylabel(f"Predicted {TARGET_COL}")
+            ax.set_title(f"complexity {int(row['complexity'])}  "
+                         f"($R^2$ = {r2_score(yt, pred):.3f})",
+                         fontsize=11, fontweight='bold')
+            ax.grid(color='gray', linestyle='--', linewidth=0.5, alpha=0.5)
+            fig.tight_layout()
+            save_fig(fig, f"pysr_complexity_{int(row['complexity']):02d}",
+                     subdir="pysr/per_equation")
+            plt.close(fig)
 
 
 # =============================================================================
