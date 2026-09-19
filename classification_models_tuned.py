@@ -4991,10 +4991,51 @@ class _SpecEstimator(ClassifierMixin, BaseEstimator):
         return labels_from_proba(self.predict_proba(X))
 
 
+def _pdp_frame(X):
+    """
+    A float64 view of X for sklearn's partial-dependence machinery.
+
+    sklearn refuses to compute partial dependence on an integer column:
+
+        ValueError: The column 0 contains integer data. Partial dependence
+        plots are not supported for integer data: this can lead to implicit
+        rounding with NumPy arrays or even errors with newer pandas versions.
+        Please convert numerical features to floating point dtypes ahead of
+        time to avoid problems.
+
+    That is a guard against silent corruption, not a limitation of the
+    method. PDP builds a grid of values for one feature and writes it back
+    into a copy of X; if the column is integer-typed, every grid point is
+    rounded on assignment, so the curve is computed at the wrong places and
+    nothing warns you.
+
+    It fires on the DATA, not on anything this pipeline does: read a CSV
+    whose curing-age column is whole numbers and pandas types it int64, and
+    the same goes for count-like or already-encoded categorical features.
+    Every integer flavour is rejected — signed, unsigned, and pandas'
+    nullable Int64 — while bool and float pass, which is why the failure can
+    hide until one particular dataset is loaded. Casting here is the fix
+    rather than retyping the training data, because the models are trained
+    and evaluated on exactly what was loaded.
+
+    Nothing about the plots changes. Every model already receives float32
+    through _SpecEstimator, and integers of this magnitude are exact in
+    float64, so a feature with fewer distinct values than grid_resolution
+    still produces exactly the same grid points it always did. Non-numeric
+    columns are left alone: they are a different problem, and sklearn's own
+    message for them is clearer than a failed cast would be.
+    """
+    if not isinstance(X, pd.DataFrame):
+        X = pd.DataFrame(np.asarray(X), columns=feature_names[:np.shape(X)[1]])
+    numeric = {c: np.float64 for c in X.columns
+               if pd.api.types.is_numeric_dtype(X[c])}
+    return X.astype(numeric) if numeric else X
+
+
 _pdp_rng = np.random.RandomState(SEED)
 _pdp_idx = _pdp_rng.choice(len(x_train), size=min(PDP_SAMPLE_SIZE, len(x_train)), replace=False)
-X_pdp      = (x_train.iloc[_pdp_idx] if hasattr(x_train, "iloc")
-              else pd.DataFrame(X_tr[_pdp_idx], columns=feature_names))
+X_pdp      = _pdp_frame(x_train.iloc[_pdp_idx] if hasattr(x_train, "iloc")
+                        else pd.DataFrame(X_tr[_pdp_idx], columns=feature_names))
 X_pdp_2way = X_pdp.iloc[:PDP_2WAY_SAMPLE]
 
 
@@ -5007,6 +5048,7 @@ ice_models = models     # base 9. Use all_models to include ensembles (much slow
 
 
 def plot_ice(specs, X_plot, features=None, n_cols=N_COLS):
+    X_plot = _pdp_frame(X_plot)
     features = features if features is not None else list(range(len(feature_names)))
     n_rows = int(np.ceil(len(features) / n_cols))
 
@@ -5123,6 +5165,7 @@ def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
     the output costs nothing extra. Two-way PD is (rows x grid^2) predictions
     per pair, which is the expensive part and is paid either way.
     """
+    X_plot = _pdp_frame(X_plot)
     pairs = pairs if pairs is not None else pdp_pairs
     if not pairs:
         print("  fewer than two features — nothing to plot.")
