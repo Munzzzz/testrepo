@@ -3623,13 +3623,63 @@ PYSR_TIMEOUT       = 300       # seconds; None for no cap
 PYSR_DETERMINISTIC = False     # True -> serial + seeded + reproducible (slower)
 PYSR_TOP_ROWS      = 15        # rungs of the Pareto front to print
 
-#  Operators. Keep the set small and physically sensible: every operator added
-#  multiplies the search space, and `exp` on unscaled mix quantities overflows
-#  happily. The *_abs variants are the protected forms — sqrt_abs and log_abs
-#  cannot produce NaN on negative arguments, which otherwise poisons a whole
-#  population.
+#  OPERATORS. Every operator added multiplies the search space, so keep the set
+#  small and sensible.
+#
+#  The names below are the ones PySR actually accepts, transcribed from its own
+#  docs/src/operators.md. That distinction matters because PySR does NOT
+#  validate operator names in Python — it passes them straight through to
+#  Julia, where an unknown name fails inside the genetic search and comes back
+#  as a `JuliaError` at fit() with a stack trace full of PythonCall frames and
+#  no mention of the operator. `sqrt_abs` and `log_abs` are the specific trap:
+#  they appear in pysr's export_sympy.py and look like "the protected
+#  variants", but that table maps Julia output names BACK to sympy — it is the
+#  read direction. Neither name is a valid input, and passing them is exactly
+#  how you get that JuliaError.
+#
+#  Plain `sqrt` and `log` are the right choice and need no protection here.
+#  SymbolicRegression.jl returns NaN rather than raising on a negative
+#  argument, and the search "will preferentially select expressions which
+#  avoid any invalid values over the training dataset" — a NaN costs an
+#  expression its fitness, it does not poison the population.
 PYSR_BINARY_OPS = ["+", "-", "*", "/"]
-PYSR_UNARY_OPS  = ["square", "sqrt_abs", "log_abs"]
+PYSR_UNARY_OPS  = ["square", "sqrt", "log"]
+
+#  The full pre-defined sets, so a bad name is caught here with a useful
+#  message instead of deep inside Julia. A string containing "=" is a custom
+#  Julia definition (e.g. "myop(x) = x^2") and is passed through unchecked.
+PYSR_UNARY_NAMES = {
+    "neg", "square", "cube", "cbrt", "sqrt", "abs", "sign", "inv",
+    "exp", "log", "log10", "log2", "log1p",
+    "sin", "cos", "tan", "asin", "acos", "atan",
+    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "erf", "erfc", "gamma", "relu", "sinc", "round", "floor", "ceil",
+}
+PYSR_BINARY_NAMES = {
+    "+", "-", "*", "/", "^",
+    "max", "min", ">", ">=", "<", "<=", "cond", "mod",
+    "logical_or", "logical_and",
+}
+
+
+def check_pysr_operators(binary=None, unary=None):
+    """Reject an unknown operator name here rather than inside Julia."""
+    for ops, valid, kind in ((binary or [], PYSR_BINARY_NAMES, "binary"),
+                             (unary or [], PYSR_UNARY_NAMES, "unary")):
+        for op in ops:
+            if "=" in op:          # a custom Julia definition, not a name
+                continue
+            if op not in valid:
+                raise ValueError(
+                    f"{op!r} is not a pre-defined PySR {kind} operator, and "
+                    f"PySR would only fail on it inside Julia.\n"
+                    f"Valid {kind} operators: {', '.join(sorted(valid))}.\n"
+                    f"To use something else, pass it as Julia source with a "
+                    f"sympy mapping, e.g. unary_operators=['myop(x) = x^2'] "
+                    f"with extra_sympy_mappings={{'myop': lambda x: x**2}}.")
+
+
+check_pysr_operators(PYSR_BINARY_OPS, PYSR_UNARY_OPS)
 
 
 #  ── FEATURE NAMES PySR WILL ACCEPT ───────────────────────────────────────────
@@ -3791,6 +3841,45 @@ def plot_pareto_front(eqs, chosen, title, filename):
     plt.close(fig)
 
 
+def fit_pysr(model, X, y, label=""):
+    """
+    Run one PySR search, turning a Julia-side failure into something readable.
+
+    A JuliaError arrives as a wall of PythonCall frames with the actual cause
+    buried, and in a notebook the middle of that traceback is usually elided
+    entirely — so the one line that says what went wrong is the line you do
+    not get to see. The causes are few and each has a specific fix, so they
+    are named here rather than left to be rediscovered.
+    """
+    t0 = time.time()
+    try:
+        model.fit(X, y)
+    except Exception as exc:
+        name = type(exc).__name__
+        print(f"\n  PySR search failed for {label or 'the target'} "
+              f"({name}).\n"
+              f"  The message below is Julia's; the usual causes are:\n"
+              f"    - an operator name Julia does not define (check_pysr_"
+              f"operators above catches\n"
+              f"      the pre-defined ones, but a typo inside a custom "
+              f"'myop(x) = ...' string reaches Julia);\n"
+              f"    - a non-finite value in X or y — PySR rejects NaN and inf "
+              f"in the target;\n"
+              f"    - a Julia backend that did not finish precompiling; "
+              f"re-running the import often\n"
+              f"      clears it, and `python -c \"import pysr\"` shows the "
+              f"real setup error on its own.\n")
+        finite_X = bool(np.isfinite(np.asarray(X, dtype=np.float64)).all())
+        finite_y = bool(np.isfinite(np.asarray(y, dtype=np.float64)).all())
+        print(f"  Checked for you: X all finite = {finite_X}, "
+              f"y all finite = {finite_y}, "
+              f"n = {len(np.asarray(y).ravel())}, "
+              f"unary = {model.unary_operators}, binary = {model.binary_operators}")
+        raise
+    print(f"Search finished in {time.time() - t0:.1f}s.")
+    return model
+
+
 if PYSR_ENABLED:
     try:
         from pysr import PySRRegressor
@@ -3838,9 +3927,8 @@ if PYSR_AVAILABLE:
         temp_equation_file = True,                # no stray files in the cwd
     )
 
-    _t0 = time.time()
-    pysr_model.fit(X_sym_tr, np.asarray(y_tr, dtype=np.float64).ravel())
-    print(f"Search finished in {time.time() - _t0:.1f}s.")
+    fit_pysr(pysr_model, X_sym_tr, np.asarray(y_tr, dtype=np.float64).ravel(),
+             label=TARGET_COL)
 
     pysr_eqs, pysr_best = print_pareto_front(
         pysr_model, f"PySR PARETO FRONT — every rung from constant to complex")
