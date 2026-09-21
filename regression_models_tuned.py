@@ -45,6 +45,19 @@
 # =============================================================================
 
 # =============================================================================
+#  HOW TO RUN IT: TOP TO BOTTOM, IN ORDER.
+#
+#  Every section builds on state the earlier ones created — the fitted models,
+#  the split, the SHAP results, the configuration constants. Running a cell on
+#  its own in a fresh kernel raises NameError on whichever of those it reaches
+#  first, which points at the cell you are in rather than at the cells you
+#  skipped. Function definitions are written so the `def` itself never needs
+#  anything from another cell (defaults are resolved when the function is
+#  CALLED, not when it is defined), but the data they operate on still has to
+#  exist. Re-running a section after a kernel restart means re-running from
+#  Section 0.
+# =============================================================================
+# =============================================================================
 #  SECTION 0 — COMMON SETUP  (run this cell once, before everything else)
 # =============================================================================
 import warnings, time, os, re, textwrap
@@ -190,8 +203,9 @@ def register_table(name, df, index=False):
     return df
 
 
-def export_tables(path=RESULTS_XLSX):
+def export_tables(path=None):
     """Write every registered table to one workbook, one sheet per table."""
+    path = RESULTS_XLSX if path is None else path
     if not RESULT_TABLES:
         print("No tables registered — nothing to export.")
         return None
@@ -380,7 +394,7 @@ X = cs.drop(TARGET_COL, axis=1)
 Y = cs[TARGET_COL]
 
 
-def split_imbalance(X_df, y_ser, seed, test_size=TEST_SIZE):
+def split_imbalance(X_df, y_ser, seed, test_size=None):
     """
     Two-sample KS statistic between the train and test halves, computed
     per column (all features + the target). KS is distribution-free and
@@ -388,19 +402,21 @@ def split_imbalance(X_df, y_ser, seed, test_size=TEST_SIZE):
     alone would miss. Returns (worst_column_KS, mean_KS).
     Lower is better; 0 would mean identical empirical distributions.
     """
+    test_size = TEST_SIZE if test_size is None else test_size
     Xa, Xb, ya, yb = train_test_split(X_df, y_ser, test_size=test_size, random_state=seed)
     ks = [ks_2samp(Xa[c], Xb[c]).statistic for c in X_df.columns]
     ks.append(ks_2samp(ya, yb).statistic)
     return float(np.max(ks)), float(np.mean(ks))
 
 
-def find_best_seed(X_df, y_ser, candidate_seeds=range(1000), test_size=TEST_SIZE, top_n=5):
+def find_best_seed(X_df, y_ser, candidate_seeds=range(1000), test_size=None, top_n=5):
     """
     Minimax criterion: pick the seed whose WORST-matched column is best
     matched, tie-broken on the mean. Minimising the worst column (rather than
     the average) is the point — an average can stay low while one feature is
     badly split, which is exactly the 'biased split' case you want to avoid.
     """
+    test_size = TEST_SIZE if test_size is None else test_size
     rows = [(s, *split_imbalance(X_df, y_ser, s, test_size)) for s in candidate_seeds]
     scores = (pd.DataFrame(rows, columns=['seed', 'max_KS', 'mean_KS'])
                 .sort_values(['max_KS', 'mean_KS'])
@@ -1846,11 +1862,22 @@ fold_range = range(2, 11)     # k = 2 ... 10
 SWEEP_METRICS = ("R2", "RMSE", "MAPE", "SI")
 
 
-def fold_sweep(spec, X, y, fold_range=fold_range):
-    """Returns {metric: {'means': [...], 'stds': [...]}} across fold_range,
-    refitting spec's already-tuned hyperparameters fresh on each fold split."""
+def fold_sweep(spec, X, y, folds=None):
+    """
+    Returns {metric: {'means': [...], 'stds': [...]}} across the fold counts,
+    refitting spec's already-tuned hyperparameters fresh on each fold split.
+
+    The parameter is `folds`, not `fold_range`, so it does not shadow the
+    module-level `fold_range` it defaults to. `def f(fold_range=fold_range)`
+    captures the global when the def RUNS, which in a notebook means the def
+    cannot even be defined before the cell that sets it; and the obvious
+    late-binding rewrite is silently broken when the names match, because
+    `fold_range = fold_range if fold_range is None else fold_range` resolves
+    both sides to the parameter and leaves it None.
+    """
+    folds = fold_range if folds is None else folds
     out = {metric: {"means": [], "stds": []} for metric in SWEEP_METRICS}
-    for k in fold_range:
+    for k in folds:
         kfold = KFold(n_splits=k, shuffle=True, random_state=SEED)
         fold_scores = {metric: [] for metric in SWEEP_METRICS}
         for tr, va in kfold.split(X):
@@ -2102,11 +2129,13 @@ train_sizes_pct = np.linspace(0.1, 1.0, 10)
 lc_cv = KFold(n_splits=5, shuffle=True, random_state=SEED)
 
 
-def get_learning_curve(spec, X, y, train_sizes=train_sizes_pct, cv=lc_cv):
+def get_learning_curve(spec, X, y, train_sizes=None, cv=None):
     """
     Unified learning-curve computation across all 9 models.
     Returns (abs_train_sizes, train_mean, train_std, val_mean, val_std) — R2.
     """
+    train_sizes = train_sizes_pct if train_sizes is None else train_sizes
+    cv = lc_cv if cv is None else cv
     if hasattr(spec.model, "get_params"):     # sklearn-compatible estimator
         sizes, tr_scores, va_scores = learning_curve(
             spec.model, X, y, train_sizes=train_sizes, cv=cv, n_jobs=-1, scoring='r2')
@@ -2553,8 +2582,9 @@ bv_models = models          # e.g. [rf, svr, xgboost_model, lgbm, ada, knn] for 
 
 
 def bias_variance_decomposition(spec, X_train, y_train, X_test, y_test,
-                                n_bootstrap=N_BOOTSTRAP, params=None):
+                                n_bootstrap=None, params=None):
     """Returns (bias_sq, variance, total_mse) via bootstrap resampling."""
+    n_bootstrap = N_BOOTSTRAP if n_bootstrap is None else n_bootstrap
     rng = np.random.RandomState(SEED)
     preds = np.zeros((n_bootstrap, len(X_test)))
     for b in range(n_bootstrap):
@@ -2673,7 +2703,9 @@ plot_bias_variance_curve(
 SEED_SENSITIVITY_SEEDS = [BEST_SEED, 0, 1, 7, 42]
 
 
-def seed_sensitivity(models, X_df, y_ser, seeds=SEED_SENSITIVITY_SEEDS, test_size=TEST_SIZE):
+def seed_sensitivity(models, X_df, y_ser, seeds=None, test_size=None):
+    seeds = SEED_SENSITIVITY_SEEDS if seeds is None else seeds
+    test_size = TEST_SIZE if test_size is None else test_size
     rows = []
     for spec in models:
         scores = []
@@ -2908,7 +2940,7 @@ PERM_N_REPEATS = 10          # shuffles per feature; more repeats = tighter erro
 PERM_MODELS    = models      # use all_models to also cover the Section 4B ensembles
 
 
-def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED):
+def permutation_importance_spec(spec, X, y, n_repeats=None, seed=None):
     """
     Model-agnostic permutation importance for one already-fitted ModelSpec.
 
@@ -2920,6 +2952,8 @@ def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED)
     and every entry is baseline - R2_after_shuffling. Positive means the model
     got worse without the feature, i.e. the feature was carrying something.
     """
+    n_repeats = PERM_N_REPEATS if n_repeats is None else n_repeats
+    seed = SEED if seed is None else seed
     rng = np.random.RandomState(seed)
     X = np.array(X, dtype=np.float64, copy=True)    # never mutate the caller's array
     baseline = r2_score(y, spec.predict(X))
@@ -2933,8 +2967,9 @@ def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED)
     return baseline, drops
 
 
-def compute_permutation_importance(specs=PERM_MODELS):
+def compute_permutation_importance(specs=None):
     """Run the permutation for every spec on both splits; returns a long frame."""
+    specs = PERM_MODELS if specs is None else specs
     rows, store = [], {}
     for spec in specs:
         for split, (Xs, ys) in (("test", (X_te, y_te)), ("train", (X_tr, y_tr))):
@@ -2962,7 +2997,8 @@ register_table("Permutation importance", perm_df)
 
 
 # ── PER-MODEL BAR CHARTS (mean drop +/- std over the repeats) ─────────────────
-def plot_permutation_importance(specs=PERM_MODELS, split="test"):
+def plot_permutation_importance(specs=None, split="test"):
+    specs = PERM_MODELS if specs is None else specs
     for spec in specs:
         baseline, drops = PERM_RESULTS[(spec.name, split)]
         means, stds = drops.mean(axis=1), drops.std(axis=1)
@@ -3384,7 +3420,8 @@ X_pdp_2way = X_pdp.iloc[:PDP_2WAY_SAMPLE]
 ice_models = models     # base 9. Use all_models to include ensembles (much slower).
 
 
-def plot_ice(specs, X_plot, features=None, n_cols=N_COLS):
+def plot_ice(specs, X_plot, features=None, n_cols=None):
+    n_cols = N_COLS if n_cols is None else n_cols
     X_plot = _pdp_frame(X_plot)
     features = features if features is not None else list(range(len(feature_names)))
     n_rows = int(np.ceil(len(features) / n_cols))
@@ -3461,7 +3498,8 @@ plot_ice(ice_models, X_pdp)
 #  |SHAP| (consensus across the models explained in Section 9) and all pairs of
 #  those are plotted. That makes the truncation principled — the pairs shown
 #  are the ones the models actually rely on.
-def top_features_by_shap(k=PDP_TOP_K):
+def top_features_by_shap(k=None):
+    k = PDP_TOP_K if k is None else k
     try:
         imp = np.mean([np.abs(e.values).mean(axis=0) for e in SHAP_RESULTS.values()], axis=0)
         order = np.argsort(imp)[::-1][:k]
@@ -3482,7 +3520,8 @@ print(f"Plotting {len(pdp_pairs)} two-way interactions.")
 pdp_2way_models = [rf, xgboost_model, lgbm]
 
 
-def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
+def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=None):
+    n_cols = N_COLS if n_cols is None else n_cols
     X_plot = _pdp_frame(X_plot)
     pairs = pairs if pairs is not None else pdp_pairs
     n_rows = int(np.ceil(len(pairs) / n_cols))
@@ -3759,7 +3798,7 @@ def _wrap_equation(text, indent=8, width=78):
                          break_long_words=False, break_on_hyphens=False)
 
 
-def print_pareto_front(model, title, top=PYSR_TOP_ROWS):
+def print_pareto_front(model, title, top=None):
     """
     Print the Pareto front as a readable ladder, simplest rung first.
 
@@ -3768,6 +3807,7 @@ def print_pareto_front(model, title, top=PYSR_TOP_ROWS):
     here: fixed-width columns, the equation last so it can run long, and a
     marker on the rung `model_selection` actually chose.
     """
+    top = PYSR_TOP_ROWS if top is None else top
     eqs = model.equations_
     if isinstance(eqs, list):                 # multi-output; this file is single
         eqs = eqs[0]

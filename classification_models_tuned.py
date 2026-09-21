@@ -63,6 +63,19 @@
 # =============================================================================
 
 # =============================================================================
+#  HOW TO RUN IT: TOP TO BOTTOM, IN ORDER.
+#
+#  Every section builds on state the earlier ones created — the fitted models,
+#  the split, the SHAP results, the configuration constants. Running a cell on
+#  its own in a fresh kernel raises NameError on whichever of those it reaches
+#  first, which points at the cell you are in rather than at the cells you
+#  skipped. Function definitions are written so the `def` itself never needs
+#  anything from another cell (defaults are resolved when the function is
+#  CALLED, not when it is defined), but the data they operate on still has to
+#  exist. Re-running a section after a kernel restart means re-running from
+#  Section 0.
+# =============================================================================
+# =============================================================================
 #  SECTION 0 — COMMON SETUP  (run this cell once, before everything else)
 # =============================================================================
 import warnings, time, os, re, textwrap
@@ -322,8 +335,9 @@ def register_table(name, df, index=False):
     return df
 
 
-def export_tables(path=RESULTS_XLSX):
+def export_tables(path=None):
     """Write every registered table to one workbook, one sheet per table."""
+    path = RESULTS_XLSX if path is None else path
     if not RESULT_TABLES:
         print("No tables registered — nothing to export.")
         return None
@@ -942,7 +956,7 @@ SCORING = resolve_scoring(N_CLASSES)
 print(f"\nSearch objective: PRIMARY_METRIC={PRIMARY_METRIC} -> sklearn scoring={SCORING!r}")
 
 
-def split_imbalance(X_df, y_ser, seed, test_size=TEST_SIZE):
+def split_imbalance(X_df, y_ser, seed, test_size=None):
     """
     Per-column two-sample KS statistic between the train and test halves of the
     FEATURES, plus the class-proportion drift on the target. KS is
@@ -952,6 +966,7 @@ def split_imbalance(X_df, y_ser, seed, test_size=TEST_SIZE):
     Returns (worst_feature_KS, mean_feature_KS, class_share_drift).
     Lower is better; 0 would mean identical empirical distributions.
     """
+    test_size = TEST_SIZE if test_size is None else test_size
     Xa, Xb, ya, yb = train_test_split(X_df, y_ser, test_size=test_size,
                                       random_state=seed, stratify=y_ser)
     ks = [ks_2samp(Xa[c], Xb[c]).statistic for c in X_df.columns]
@@ -967,8 +982,8 @@ def split_imbalance(X_df, y_ser, seed, test_size=TEST_SIZE):
 SEED_SCAN_RANGE = range(int(os.environ.get("SEED_SCAN_N", 1000)))
 
 
-def find_best_seed(X_df, y_ser, candidate_seeds=SEED_SCAN_RANGE,
-                   test_size=TEST_SIZE, top_n=5):
+def find_best_seed(X_df, y_ser, candidate_seeds=None,
+                   test_size=None, top_n=5):
     """
     Minimax criterion: pick the seed whose WORST-matched feature column is best
     matched, tie-broken on the mean. Minimising the worst column (rather than
@@ -978,6 +993,8 @@ def find_best_seed(X_df, y_ser, candidate_seeds=SEED_SCAN_RANGE,
     Cost is len(candidate_seeds) x n_features KS tests. Trim SEED_SCAN_N on a
     wide dataset; the gain past a few hundred draws is small.
     """
+    candidate_seeds = SEED_SCAN_RANGE if candidate_seeds is None else candidate_seeds
+    test_size = TEST_SIZE if test_size is None else test_size
     rows = [(s, *split_imbalance(X_df, y_ser, s, test_size)) for s in candidate_seeds]
     scores = (pd.DataFrame(rows, columns=['seed', 'max_KS', 'mean_KS', 'class_drift'])
                 .sort_values(['max_KS', 'mean_KS'])
@@ -1194,7 +1211,7 @@ if BINARY_FEATURE_IDX and RESAMPLING in ("smote", "borderline", "svm", "adasyn")
           f"keeps them binary.")
 
 
-def resolve_smote_k(y, n_splits=5, requested=SMOTE_K):
+def resolve_smote_k(y, n_splits=5, requested=None):
     """
     Largest usable k_neighbors.
 
@@ -1204,6 +1221,7 @@ def resolve_smote_k(y, n_splits=5, requested=SMOTE_K):
     whole training set. Getting this wrong surfaces as
     "Expected n_neighbors <= n_samples" from deep inside a CV loop, hours in.
     """
+    requested = SMOTE_K if requested is None else requested
     smallest = int(np.bincount(y, minlength=N_CLASSES).min())
     in_fold  = int(np.floor(smallest * (n_splits - 1) / n_splits))
     return max(1, min(requested, in_fold - 1)), smallest, in_fold
@@ -3176,11 +3194,22 @@ print(f"\nK-fold sweep range: k = {fold_range.start}..{fold_range.stop - 1} "
       f"(capped by the rarest class, n={_min_class_count})")
 
 
-def fold_sweep(spec, X, y, fold_range=fold_range):
-    """Returns {metric: {'means': [...], 'stds': [...]}} across fold_range,
-    refitting spec's already-tuned hyperparameters fresh on each fold split."""
+def fold_sweep(spec, X, y, folds=None):
+    """
+    Returns {metric: {'means': [...], 'stds': [...]}} across the fold counts,
+    refitting spec's already-tuned hyperparameters fresh on each fold split.
+
+    The parameter is `folds`, not `fold_range`, so it does not shadow the
+    module-level `fold_range` it defaults to. `def f(fold_range=fold_range)`
+    captures the global when the def RUNS, which in a notebook means the def
+    cannot even be defined before the cell that sets it; and the obvious
+    late-binding rewrite is silently broken when the names match, because
+    `fold_range = fold_range if fold_range is None else fold_range` resolves
+    both sides to the parameter and leaves it None.
+    """
+    folds = fold_range if folds is None else folds
     out = {metric: {"means": [], "stds": []} for metric in SWEEP_METRICS}
-    for k in fold_range:
+    for k in folds:
         kfold = StratifiedKFold(n_splits=k, shuffle=True, random_state=SEED)
         fold_scores = {metric: [] for metric in SWEEP_METRICS}
         for tr, va in kfold.split(X, y):
@@ -3429,8 +3458,9 @@ ROC_MAX_MODELS = 8
 ACCENT = SERIES_COLORS[0]
 
 
-def top_models(specs=None, n=ROC_MAX_MODELS, metric="ROC_AUC"):
+def top_models(specs=None, n=None, metric="ROC_AUC"):
     """The n best fitted models by a test metric, best first."""
+    n = ROC_MAX_MODELS if n is None else n
     specs = specs if specs is not None else all_models
     scored = [(s, RESULTS[s.name].get(metric, float("nan"))) for s in specs
               if s.name in RESULTS]
@@ -3439,8 +3469,30 @@ def top_models(specs=None, n=ROC_MAX_MODELS, metric="ROC_AUC"):
 
 
 def comparison_colors(specs):
-    """Fixed-slot hue assignment for one comparison figure."""
-    return {s.name: SERIES_COLORS[i] for i, s in enumerate(specs)}
+    """
+    Fixed-slot hue assignment for one comparison figure.
+
+    The palette holds 8 hues, and every overlay caller feeds this from
+    top_models(n=ROC_MAX_MODELS), which caps at exactly that. A caller that
+    passes the whole roster instead — 9 base models, or all_models with the
+    ensembles — used to run off the end of the list and raise a bare
+    IndexError from inside a dict comprehension, naming neither the palette
+    nor the caller.
+
+    Hues now repeat rather than crash, which is right for the per-model
+    figures (each is its own figure, so a repeat is invisible) and wrong for
+    an overlay, where two series would share a colour. So the wrap is
+    reported once instead of happening silently: an overlay caller that
+    trips it should be passing top_models() and is not.
+    """
+    if len(specs) > len(SERIES_COLORS) and not getattr(
+            comparison_colors, "_warned", False):
+        comparison_colors._warned = True
+        print(f"Note: {len(specs)} models share a {len(SERIES_COLORS)}-hue "
+              f"palette, so hues repeat. Fine for one-figure-per-model output; "
+              f"for an overlay, pass top_models(n={len(SERIES_COLORS)}).")
+    return {s.name: SERIES_COLORS[i % len(SERIES_COLORS)]
+            for i, s in enumerate(specs)}
 
 
 # =============================================================================
@@ -3470,12 +3522,14 @@ lc_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 LC_MIN_TRAIN = max(2 * N_CLASSES, 20)
 
 
-def get_learning_curve(spec, X, y, train_sizes=train_sizes_pct, cv=lc_cv):
+def get_learning_curve(spec, X, y, train_sizes=None, cv=None):
     """
     Unified learning-curve computation across all 9 models.
     Returns (abs_train_sizes, train_mean, train_std, val_mean, val_std) in the
     primary metric, or None if the model cannot produce one.
     """
+    train_sizes = train_sizes_pct if train_sizes is None else train_sizes
+    cv = lc_cv if cv is None else cv
     if hasattr(spec.model, "get_params"):     # sklearn-compatible estimator
         try:
             sizes, tr_scores, va_scores = learning_curve(
@@ -4053,13 +4107,14 @@ from sklearn.calibration import calibration_curve
 N_CALIB_BINS = 10
 
 
-def expected_calibration_error(y_true, proba, n_bins=N_CALIB_BINS):
+def expected_calibration_error(y_true, proba, n_bins=None):
     """
     Binary: gap between predicted P(positive) and observed frequency.
     Multiclass: the standard confidence-vs-accuracy form — bin rows by the
     model's max probability (its confidence in whatever it predicted) and
     compare with how often that prediction was right.
     """
+    n_bins = N_CALIB_BINS if n_bins is None else n_bins
     y_true = np.asarray(y_true).astype(int)
     P = np.asarray(proba)
     if IS_BINARY:
@@ -4489,11 +4544,12 @@ def stratified_bootstrap_index(y, rng):
 
 
 def bias_variance_decomposition(spec, X_train, y_train, X_test, y_test,
-                                n_bootstrap=N_BOOTSTRAP, params=None):
+                                n_bootstrap=None, params=None):
     """
     Kohavi-Wolpert / Domingos 0-1 loss decomposition.
     Returns (bias, net_variance, avg_loss, extras).
     """
+    n_bootstrap = N_BOOTSTRAP if n_bootstrap is None else n_bootstrap
     rng = np.random.RandomState(SEED)
     preds = np.zeros((n_bootstrap, len(X_test)), dtype=np.int64)
     for b in range(n_bootstrap):
@@ -4653,7 +4709,9 @@ for _spec, _param, _values, _xlabel, _invert in _COMPLEXITY_SWEEPS:
 SEED_SENSITIVITY_SEEDS = [BEST_SEED, 0, 1, 7, 42]
 
 
-def seed_sensitivity(models, X_df, y_ser, seeds=SEED_SENSITIVITY_SEEDS, test_size=TEST_SIZE):
+def seed_sensitivity(models, X_df, y_ser, seeds=None, test_size=None):
+    seeds = SEED_SENSITIVITY_SEEDS if seeds is None else seeds
+    test_size = TEST_SIZE if test_size is None else test_size
     rows = []
     for spec in models:
         aucs, f1s = [], []
@@ -4943,7 +5001,7 @@ PERM_N_REPEATS = 10          # shuffles per feature; more repeats = tighter erro
 PERM_MODELS    = models      # use all_models to also cover the Part 4B ensembles
 
 
-def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED):
+def permutation_importance_spec(spec, X, y, n_repeats=None, seed=None):
     """
     Model-agnostic permutation importance for one already-fitted ModelSpec.
 
@@ -4957,6 +5015,8 @@ def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED)
     and every entry is baseline - score_after_shuffling. Positive means the
     model got worse without the feature.
     """
+    n_repeats = PERM_N_REPEATS if n_repeats is None else n_repeats
+    seed = SEED if seed is None else seed
     rng = np.random.RandomState(seed)
     X = np.array(X, dtype=np.float64, copy=True)    # never mutate the caller's array
     y = np.asarray(y).astype(int)
@@ -4971,8 +5031,9 @@ def permutation_importance_spec(spec, X, y, n_repeats=PERM_N_REPEATS, seed=SEED)
     return baseline, drops
 
 
-def compute_permutation_importance(specs=PERM_MODELS):
+def compute_permutation_importance(specs=None):
     """Run the permutation for every spec on both splits; returns a long frame."""
+    specs = PERM_MODELS if specs is None else specs
     rows, store = [], {}
     for spec in specs:
         for split, (Xs, ys) in (("test", (X_te, y_te)), ("train", (X_tr, y_tr))):
@@ -5003,7 +5064,8 @@ _perm_colors = comparison_colors(PERM_MODELS)
 
 
 # ── PER-MODEL BAR CHARTS (mean drop +/- std over the repeats) ─────────────────
-def plot_permutation_importance(specs=PERM_MODELS, split="test"):
+def plot_permutation_importance(specs=None, split="test"):
+    specs = PERM_MODELS if specs is None else specs
     for spec in specs:
         baseline, drops = PERM_RESULTS[(spec.name, split)]
         means, stds = drops.mean(axis=1), drops.std(axis=1)
@@ -5455,7 +5517,8 @@ X_pdp_2way = X_pdp.iloc[:PDP_2WAY_SAMPLE]
 ice_models = models     # base 9. Use all_models to include ensembles (much slower).
 
 
-def plot_ice(specs, X_plot, features=None, n_cols=N_COLS):
+def plot_ice(specs, X_plot, features=None, n_cols=None):
+    n_cols = N_COLS if n_cols is None else n_cols
     X_plot = _pdp_frame(X_plot)
     features = features if features is not None else list(range(len(feature_names)))
     n_rows = int(np.ceil(len(features) / n_cols))
@@ -5540,7 +5603,8 @@ plot_ice(ice_models, X_pdp)
 #  features are selected by mean |SHAP| (consensus across the models explained
 #  in Section 9) and all pairs of those are plotted. That makes the truncation
 #  principled — the pairs shown are the ones the models actually rely on.
-def top_features_by_shap(k=PDP_TOP_K):
+def top_features_by_shap(k=None):
+    k = PDP_TOP_K if k is None else k
     try:
         imp = np.mean([np.abs(e.values).mean(axis=0) for e in SHAP_RESULTS.values()], axis=0)
         order = np.argsort(imp)[::-1][:k]
@@ -5562,7 +5626,7 @@ print(f"Plotting {len(pdp_pairs)} two-way interactions.")
 pdp_2way_models = [m for m in (rf, xgboost_model, lgbm) if any(x is m for x in models)]
 
 
-def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
+def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=None):
     """
     Two-way partial dependence, ONE FIGURE PER PAIR.
 
@@ -5573,6 +5637,7 @@ def plot_pdp_2way(specs, X_plot, pairs=None, n_cols=N_COLS):
     the output costs nothing extra. Two-way PD is (rows x grid^2) predictions
     per pair, which is the expensive part and is paid either way.
     """
+    n_cols = N_COLS if n_cols is None else n_cols
     X_plot = _pdp_frame(X_plot)
     pairs = pairs if pairs is not None else pdp_pairs
     if not pairs:
@@ -5876,7 +5941,7 @@ def _wrap_equation(text, indent=8, width=78):
                          break_long_words=False, break_on_hyphens=False)
 
 
-def clipped_logit(p, clip=PYSR_LOGIT_CLIP):
+def clipped_logit(p, clip=None):
     """
     log(p / (1-p)), finite everywhere.
 
@@ -5885,12 +5950,13 @@ def clipped_logit(p, clip=PYSR_LOGIT_CLIP):
     infinity makes every candidate expression's loss infinite too, so the
     search returns nothing at all and gives no hint why.
     """
+    clip = PYSR_LOGIT_CLIP if clip is None else clip
     lo = 1.0 / (1.0 + np.exp(clip))            # the p that maps to -clip
     p = np.clip(np.asarray(p, dtype=np.float64), lo, 1.0 - lo)
     return np.log(p / (1.0 - p))
 
 
-def print_pareto_front(model, title, top=PYSR_TOP_ROWS):
+def print_pareto_front(model, title, top=None):
     """
     Print the Pareto front as a readable ladder, simplest rung first.
 
@@ -5899,6 +5965,7 @@ def print_pareto_front(model, title, top=PYSR_TOP_ROWS):
     columns, the equation on its own line so it can run long, and a marker on
     the rung `model_selection` actually chose.
     """
+    top = PYSR_TOP_ROWS if top is None else top
     eqs = model.equations_
     if isinstance(eqs, list):
         eqs = eqs[0]
