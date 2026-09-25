@@ -3521,6 +3521,25 @@ lc_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 #  returning a low score, which would abort the whole sweep.
 LC_MIN_TRAIN = max(2 * N_CLASSES, 20)
 
+#  ONE THREAD PER MODEL INSIDE learning_curve(). learning_curve(n_jobs=-1)
+#  already runs one worker process per core; a model that ALSO asks for every
+#  core (n_jobs=-1: Random Forest, XGBoost, LightGBM) then runs cores x cores
+#  threads. For LightGBM that is not just wasteful: its OpenMP threads
+#  spin-wait on each other, and 4 workers x 4 threads on 4 cores stalls this
+#  section for many minutes on a curve that takes seconds. LightGBM reads an
+#  explicit n_jobs=-1 as "all cores" and ignores the per-worker thread cap
+#  joblib sets, so the cap goes on the model itself — on a clone, so the tuned
+#  model every later section uses keeps its own n_jobs.
+from sklearn.base import clone
+
+
+def single_threaded(estimator):
+    """A clone of `estimator` with every n_jobs in it, nested ones included, set to 1."""
+    est = clone(estimator)
+    est.set_params(**{k: 1 for k in est.get_params()
+                      if k == "n_jobs" or k.endswith("__n_jobs")})
+    return est
+
 
 def get_learning_curve(spec, X, y, train_sizes=None, cv=None):
     """
@@ -3533,8 +3552,8 @@ def get_learning_curve(spec, X, y, train_sizes=None, cv=None):
     if hasattr(spec.model, "get_params"):     # sklearn-compatible estimator
         try:
             sizes, tr_scores, va_scores = learning_curve(
-                spec.model, X, y, train_sizes=train_sizes, cv=cv, n_jobs=-1,
-                scoring=SCORING, error_score=np.nan)
+                single_threaded(spec.model), X, y, train_sizes=train_sizes, cv=cv,
+                n_jobs=-1, scoring=SCORING, error_score=np.nan)
             return (sizes, np.nanmean(tr_scores, axis=1), np.nanstd(tr_scores, axis=1),
                     np.nanmean(va_scores, axis=1), np.nanstd(va_scores, axis=1))
         except Exception as exc:              # e.g. KNN with k > smallest slice
