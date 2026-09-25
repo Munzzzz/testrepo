@@ -1,0 +1,33 @@
+# Streamlit settings for ML Studio (gui/app.py). Streamlit reads this file from
+# the directory it is launched in, so run the app from the repository root:
+#     streamlit run gui/app.py
+
+[server]
+# Trained-model bundles with large forests can exceed the 200 MB default.
+maxUploadSize = 1000
+
+[browser]
+gatherUsageStats = false
+
+# Light and dark are each their own set of steps from the same palette — the
+# chart surface, ink and accent the charts were validated against — rather
+# than one theme and its automatic inversion.
+[theme.light]
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f1f0ec"
+textColor = "#0b0b0b"
+primaryColor = "#2a78d6"
+borderColor = "#e1e0d9"
+chartCategoricalColors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+
+[theme.dark]
+backgroundColor = "#1a1a19"
+secondaryBackgroundColor = "#242422"
+textColor = "#ffffff"
+primaryColor = "#3987e5"
+borderColor = "#2c2c2a"
+chartCategoricalColors = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"]
+
+[client]
+# An end-user tool: hide the developer toolbar ("Deploy", rerun, etc.).
+toolbarMode = "viewer"

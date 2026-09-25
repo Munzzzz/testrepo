@@ -4094,6 +4094,168 @@ register_table("Run configuration", pd.DataFrame([
 
 export_tables()
 
+
+# =============================================================================
+#  SECTION 17 — EXPORT FOR THE GUI  (gui/app.py -> "Load trained models")
+# =============================================================================
+#  One file holding everything the GUI needs to use THESE models — the tuned,
+#  notebook-trained ones, Keras nets and stacks included: every model's fitted
+#  predictor, the train/test split, their predictions, and the metadata. The
+#  GUI then gives them the same prediction form, explanations and graphs it
+#  gives its own in-app models.
+#
+#      streamlit run gui/app.py   ->  Start from: Load trained models (.pkl)
+#                                 ->  outputs/gui_bundle.pkl
+#
+#  cloudpickle, not pickle: the predictors are CLOSURES (a scaler and a network
+#  captured inside a predict function), which plain pickle refuses. Each model
+#  is serialised on its own first, so one that cannot be pickled is reported
+#  and left out instead of sinking the file.
+#
+#  Load it in the SAME environment that trained it. That is pickle's usual
+#  rule, and sharper than usual here: a file holding XGBoost boosters and Keras
+#  weights is only readable by compatible versions of both.
+# =============================================================================
+GUI_BUNDLE_PATH = os.path.join(OUTPUT_DIR, "gui_bundle.pkl")
+
+
+def _gui_feature_info(frame):
+    """Per-feature facts for the GUI's input form — the same keys gui/engine.py uses."""
+    info = {}
+    for c in frame.columns:
+        s = frame[c]
+        if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            v = s.dropna().astype(float)
+            info[c] = {"kind": "numeric",
+                       "integer": bool(len(v)) and bool(np.all(np.isclose(v, np.round(v)))),
+                       "min": float(v.min()), "max": float(v.max()),
+                       "mean": float(v.mean()), "median": float(v.median()),
+                       "std": float(v.std(ddof=0)) if len(v) > 1 else 0.0,
+                       "q01": float(v.quantile(0.01)), "q99": float(v.quantile(0.99)),
+                       "n_missing": int(s.isna().sum())}
+        else:
+            counts = s.dropna().astype(str).value_counts()
+            info[c] = {"kind": "categorical", "categories": list(counts.index),
+                       "mode": counts.index[0] if len(counts) else "",
+                       "n_missing": int(s.isna().sum())}
+    return info
+
+
+def _pysr_as_numpy():
+    """
+    Section 16's selected equation as a plain numpy function, or None.
+
+    The GUI cannot unpickle a PySRRegressor without starting Julia, so the
+    equation travels as what it is — an expression — lambdified to numpy. It
+    then appears in the GUI's model list and predicts like any other model.
+    """
+    if not (globals().get("PYSR_AVAILABLE") and "pysr_model" in globals()):
+        return None, None
+    import sympy
+    expr = pysr_model.sympy()
+    f = sympy.lambdify([sympy.Symbol(n) for n in pysr_names], expr, "numpy")
+
+    def pysr_predict(A, _f=f):
+        A = np.asarray(A, dtype=np.float64)
+        out = np.asarray(_f(*A.T), dtype=np.float64)
+        return np.broadcast_to(out, (A.shape[0],)).copy()     # a constant is a scalar
+
+    extras = {"lhs": TARGET_COL, "equation": str(pysr_best["equation"]),
+              "latex": pysr_model.latex(precision=4),
+              "front": pysr_eqs[["complexity", "loss", "equation"]].copy(),
+              "renamed": dict(pysr_renamed)}
+    return pysr_predict, extras
+
+
+def export_gui_bundle(path=None, specs=None):
+    """Write every fitted model and its context to one file the GUI can load."""
+    try:
+        import cloudpickle
+    except ImportError:
+        print("cloudpickle is needed for the GUI export:  pip install cloudpickle")
+        return None
+    import datetime
+    path = GUI_BUNDLE_PATH if path is None else path
+    specs = all_models if specs is None else specs
+    cols = list(x_train.columns)
+
+    def encode(df, _cols=tuple(cols)):
+        """Raw form input -> the float32 matrix every predict_fn here expects."""
+        return np.asarray(df[list(_cols)], dtype=np.float32)
+
+    models, test_pred, train_pred = {}, {}, {}
+    cv_score, params, fit_time, skipped = {}, {}, {}, []
+    for spec in specs:
+        if spec.predict_fn is None:
+            skipped.append((spec.name, "not fitted"))
+            continue
+        try:
+            cloudpickle.dumps(spec.predict_fn)
+        except Exception as exc:
+            skipped.append((spec.name, f"{type(exc).__name__}: {exc}"))
+            continue
+        models[spec.name] = spec.predict_fn
+        test_pred[spec.name] = np.asarray(spec.predict(X_te), dtype=np.float64).ravel()
+        train_pred[spec.name] = np.asarray(spec.predict(X_tr), dtype=np.float64).ravel()
+        cv_score[spec.name] = None if spec.cv_rmse is None else float(spec.cv_rmse)
+        params[spec.name] = dict(spec.best_params or {})
+        fit_time[spec.name] = spec.fit_time_s
+
+    extras = {}
+    try:
+        f, eq = _pysr_as_numpy()
+        if f is not None:
+            models["PySR (symbolic)"] = f
+            test_pred["PySR (symbolic)"] = f(X_te)
+            train_pred["PySR (symbolic)"] = f(X_tr)
+            cv_score["PySR (symbolic)"], params["PySR (symbolic)"] = None, {}
+            fit_time["PySR (symbolic)"] = None
+            extras["pysr"] = eq
+    except Exception as exc:
+        print(f"  PySR equation not exported: {type(exc).__name__}: {exc}")
+
+    if not models:
+        print("No model could be exported.")
+        return None
+    # The notebook's own choice of best — the lowest test RMSE, as in the
+    # summary table — so the GUI highlights the same model the notebook did.
+    best = min(models, key=lambda n: rmse(y_te, test_pred[n]))
+    bundle = {
+        "format": "ml-gui-bundle/1",
+        "task": "regression",
+        "source": "Notebook: regression_models_tuned",
+        "target": TARGET_COL,
+        "features": cols,
+        "feature_info": _gui_feature_info(x_train),
+        "encode": encode,
+        "models": models,
+        "classes": None, "positive_index": 1,
+        "X_train": x_train.reset_index(drop=True), "X_test": x_test.reset_index(drop=True),
+        "y_train": np.asarray(y_tr, dtype=np.float64), "y_test": np.asarray(y_te, dtype=np.float64),
+        "test_pred": test_pred, "train_pred": train_pred,
+        "cv_score": cv_score, "params": params, "fit_time": fit_time,
+        "primary_metric": "RMSE", "rank_by": "test",
+        "best_model": best,
+        "selection_note": "lowest test RMSE — the same choice as the notebook's summary table",
+        "refit": {}, "failures": dict(skipped), "skipped": [],
+        "settings": {"split seed": BEST_SEED, "test size": TEST_SIZE},
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "extras": extras,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as fh:
+        cloudpickle.dump(bundle, fh)
+    print(f"\nGUI bundle written: {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
+          f"{len(models)} models, best = {best})")
+    for name, why in skipped:
+        print(f"  left out {name}: {why}")
+    print("  Open it with:  streamlit run gui/app.py  ->  Load trained models (.pkl)")
+    return path
+
+
+export_gui_bundle()
+
+
 print(f"\n{len(SAVED_FIGURES)} figure(s) written under {FIGURE_DIR}/")
 _by_dir = {}
 for _path in SAVED_FIGURES:

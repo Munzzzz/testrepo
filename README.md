@@ -11,17 +11,79 @@ markdown cells and the code in code cells:
 
 | Notebook | Cells |
 | --- | --- |
-| `classification_models_tuned.ipynb` | 79 markdown, 66 code |
-| `regression_models_tuned.ipynb` | 55 markdown, 42 code |
+| `classification_models_tuned.ipynb` | 106 markdown, 93 code |
+| `regression_models_tuned.ipynb` | 72 markdown, 59 code |
 
 They are generated from the scripts and carry the same code, unchanged and in
 the same order, so either form can be run. The comments that documented a
 section became markdown; short comments explaining the line they sit on stayed
-with their code.
+with their code. Run them top to bottom: later cells use what earlier cells
+built.
 
-Note that `regression_models_tuned.py` is not itself in this branch (it was
-added to `main` and then deleted), so `regression_models_tuned.ipynb` is the
-copy of that workflow here.
+## ML Studio — the GUI
+
+A point-and-click front end for both workflows (`gui/app.py`). Load a data
+file, train, and then — the main event — **type in each input variable and get
+a prediction from the best model**.
+
+```bash
+pip install -r requirements-gui.txt
+streamlit run gui/app.py          # from the repository root
+```
+
+On Windows, double-click `launch_gui.bat`. It opens in your browser.
+
+**Sidebar — your data.** Upload a CSV or Excel file (or pick the built-in
+concrete demo), choose the output column — regression or classification is
+detected and can be overridden — pick the input variables, and press **Train
+models**. Tuning depth is Quick / Balanced / Thorough, as in the notebooks'
+tuning profiles. Classification adds the positive class and a SMOTE option.
+
+**🔮 Predict — the highlight.** A form with one field per input variable,
+pre-filled with typical values (or with any test row, so you can compare the
+prediction to the real answer). The result shows:
+
+* the prediction — for regression with a **90% prediction interval**
+  (split-conformal, from the model's held-out errors), for classification the
+  class and its probability;
+* **why**: a Shapley ledger from a typical input to this prediction, one bar
+  per variable, adding up exactly;
+* **what-if**: how the prediction moves as one variable is swept, with the
+  training range marked so extrapolation is visible;
+* **do the models agree?**: every model's answer for the same input;
+* warnings when an input is outside the training range, or when the
+  *combination* of inputs is unlike anything in the training data.
+
+A file of many rows can be predicted at once and downloaded, with rows that
+fall outside the training range flagged.
+
+**📊 Data explorer** — one dropdown for the data's statistics and graphs:
+overview, summary statistics, target, distributions, box plots, the
+correlation matrix (`*` p < 0.01, `**` p < 0.05, diagonal removed — the
+notebooks' convention), feature vs target, pairwise scatter, missing values,
+outliers.
+
+**🏆 Model explorer** — the best model and how it was chosen, the full
+leaderboard, and dropdowns to pick any model, any metrics, and any graph:
+actual vs predicted, residuals, error by range, permutation importance,
+learning curve, metric comparison and Taylor diagram (regression); confusion
+matrix, ROC, precision-recall, calibration, threshold analysis, probability
+distributions and per-class metrics (classification).
+
+**Using the notebooks' own models.** Both notebooks end with
+`export_gui_bundle()`, which writes `outputs/gui_bundle.pkl`. In the GUI choose
+*Start from → Load trained models (.pkl)*: the tuned notebook models — Keras
+networks, stacks and the PySR equation included — then drive the same
+prediction form and graphs, and predict exactly what they predicted in the
+notebook. Load the file in the same Python environment that created it, and
+only open `.pkl` files you made yourself (loading one can run code). Models
+trained in the GUI can be saved the same way from the sidebar.
+
+In-app training uses the notebooks' model families with sklearn's MLP standing
+in for the Keras networks (much faster, and the notebook's Keras models are one
+export away) and a regularised linear model for the sequential linear/logistic
+ones. The best model is chosen by cross-validation on the training split, so
+its test score is an honest estimate.
 
 ## `classification_models_tuned.py`
 

@@ -1,0 +1,16 @@
+# ML Studio — the GUI in gui/app.py.
+#   pip install -r requirements-gui.txt
+# Versions it was built and tested against are noted; newer minor versions
+# should work. A trained-models file (.pkl) must be loaded with the same
+# library versions that saved it.
+streamlit>=1.64        # tested 1.64.0 — tabs and theme settings rely on 1.64
+plotly>=6.0            # tested 7.1.0
+pandas>=2.2            # tested 3.0.5
+numpy
+scipy
+scikit-learn>=1.6      # tested 1.9.1
+xgboost                # tested 3.2.0
+lightgbm               # tested 4.7.0
+imbalanced-learn       # SMOTE option; tested 0.14.2
+cloudpickle            # saving/loading trained models; tested 3.1.2
+openpyxl               # reading .xlsx uploads

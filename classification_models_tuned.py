@@ -6286,6 +6286,258 @@ register_table("Run configuration", pd.DataFrame([
 
 export_tables()
 
+
+# =============================================================================
+#  SECTION 17 — EXPORT FOR THE GUI  (gui/app.py -> "Load trained models")
+# =============================================================================
+#  One file holding everything the GUI needs to use THESE models — the tuned,
+#  notebook-trained ones, Keras nets and stacks included: every model's fitted
+#  predictor, the train/test split, their probabilities, and the metadata.
+#
+#      streamlit run gui/app.py   ->  Start from: Load trained models (.pkl)
+#                                 ->  outputs/gui_bundle.pkl
+#
+#  THE ENCODING PROBLEM. The models here were trained on encode_features()'s
+#  output — one-hot columns, expanded dates, ordinal codes — not on the raw
+#  columns a person would type into a form. encode_features() cannot just be
+#  called on a single new row: it is a whole-frame transform that DECIDES what
+#  to drop and how to encode by looking at every row, and on one row every
+#  column is "constant" and would be thrown away. GuiRawEncoder records the
+#  decisions it made on the full frame and replays exactly those on new rows,
+#  so the GUI's form asks for the raw columns and the models still receive
+#  what they were trained on. The export then CHECKS the replay reproduces
+#  this notebook's own encoded matrix, value for value, before relying on it;
+#  if it ever does not, the GUI is given the encoded columns directly instead.
+#
+#  cloudpickle, not pickle: the predictors are closures, which plain pickle
+#  refuses. Load the file in the environment that trained it.
+# =============================================================================
+GUI_BUNDLE_PATH = os.path.join(OUTPUT_DIR, "gui_bundle.pkl")
+
+
+class GuiRawEncoder:
+    """encode_features(), replayed on new rows from the decisions it made on the full frame."""
+
+    def __init__(self, X_raw, X_enc):
+        self.enc_cols = list(X_enc.columns)
+        self.medians = X_enc.median(numeric_only=True)
+        self.plan = []
+        for c in X_raw.columns:
+            s = X_raw[c]
+            if s.nunique(dropna=False) <= 1 or (_is_text_like(s) and s.nunique() == len(X_raw)):
+                continue                                   # dropped: constant / identifier
+            if pd.api.types.is_datetime64_any_dtype(s) or (_is_text_like(s) and _looks_like_dates(s)):
+                self.plan.append((c, "datetime", None))
+            elif pd.api.types.is_bool_dtype(s):
+                self.plan.append((c, "bool", None))
+            elif _is_text_like(s) and s.nunique() <= ONEHOT_MAX_CARDINALITY:
+                # Exact dummy names, taken from get_dummies itself rather than
+                # rebuilt by string formatting, so they cannot drift from it.
+                names = pd.get_dummies(X_raw[[c]], columns=[c], dtype=np.float64).columns
+                self.plan.append((c, "onehot", [n[len(c) + 1:] for n in names]))
+            elif _is_text_like(s):
+                classes = sorted(s.astype(str).unique())  # LabelEncoder's own ordering
+                self.plan.append((c, "ordinal", {v: i for i, v in enumerate(classes)}))
+            else:
+                self.plan.append((c, "numeric", None))
+        self.raw_cols = [c for c, _, _ in self.plan]
+
+    def __call__(self, df):
+        out = {}
+        for c, kind, payload in self.plan:
+            s = df[c] if c in df.columns else pd.Series(np.nan, index=df.index)
+            if kind == "numeric":
+                out[c] = pd.to_numeric(s, errors="coerce")
+            elif kind == "bool":
+                out[c] = s.map(lambda v: np.nan if pd.isna(v) else
+                               float(str(v).strip().lower() in ("true", "1", "yes")))
+            elif kind == "datetime":
+                dt = pd.to_datetime(s, errors="coerce")
+                out[f"{c}_year"], out[f"{c}_month"] = dt.dt.year, dt.dt.month
+                out[f"{c}_dayofweek"] = dt.dt.dayofweek
+                out[f"{c}_is_weekend"] = (dt.dt.dayofweek >= 5).astype(float)
+            elif kind == "onehot":
+                text = s.map(lambda v: None if pd.isna(v) else str(v))
+                for level in payload:
+                    out[f"{c}_{level}"] = (text == level).astype(np.float64)
+            else:
+                out[c] = s.astype(str).map(payload)
+        enc = pd.DataFrame(out, index=df.index).reindex(columns=self.enc_cols, fill_value=0.0)
+        return np.asarray(enc.astype(np.float64).fillna(self.medians), dtype=np.float32)
+
+
+def _gui_feature_info(frame):
+    """Per-feature facts for the GUI's input form — the same keys gui/engine.py uses."""
+    info = {}
+    for c in frame.columns:
+        s = frame[c]
+        if pd.api.types.is_datetime64_any_dtype(s) or (_is_text_like(s) and _looks_like_dates(s)):
+            d = pd.to_datetime(s, errors="coerce").dropna()
+            info[c] = {"kind": "text", "default": str(d.median().date()) if len(d) else "",
+                       "n_missing": int(s.isna().sum())}
+        elif pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+            v = s.dropna().astype(float)
+            info[c] = {"kind": "numeric",
+                       "integer": bool(len(v)) and bool(np.all(np.isclose(v, np.round(v)))),
+                       "min": float(v.min()), "max": float(v.max()),
+                       "mean": float(v.mean()), "median": float(v.median()),
+                       "std": float(v.std(ddof=0)) if len(v) > 1 else 0.0,
+                       "q01": float(v.quantile(0.01)), "q99": float(v.quantile(0.99)),
+                       "n_missing": int(s.isna().sum())}
+        else:
+            counts = s.dropna().astype(str).value_counts()
+            info[c] = {"kind": "categorical", "categories": list(counts.index),
+                       "mode": counts.index[0] if len(counts) else "",
+                       "n_missing": int(s.isna().sum())}
+    return info
+
+
+def _pysr_as_numpy():
+    """
+    Section 16's symbolic rule as a plain numpy predict_proba, or None.
+
+    Mirrors symbolic_proba() exactly — sigmoid of the positive class's
+    expression for binary, softmax over the one-vs-rest expressions for
+    multiclass — but from lambdified sympy, so the GUI never needs Julia.
+    """
+    if not (globals().get("PYSR_AVAILABLE") and globals().get("PYSR_MODELS")):
+        return None, None
+    import sympy
+    syms = [sympy.Symbol(n) for n in pysr_names]
+    fns = [(k, sympy.lambdify(syms, PYSR_MODELS[k].sympy(), "numpy")) for k in _classes_to_fit]
+    binary, pos, clip, K = IS_BINARY, POS_LABEL, PYSR_LOGIT_CLIP, N_CLASSES
+
+    def pysr_proba(A, _fns=fns):
+        A = np.asarray(A, dtype=np.float64)
+        raw = np.column_stack([np.broadcast_to(np.asarray(f(*A.T), dtype=np.float64),
+                                               (A.shape[0],)) for _, f in _fns])
+        if binary:
+            p = 1.0 / (1.0 + np.exp(-np.clip(raw[:, 0], -clip, clip)))
+            P = np.column_stack([1.0 - p, p])
+            return P if pos == 1 else P[:, ::-1]
+        raw = raw - raw.max(axis=1, keepdims=True)
+        e = np.exp(np.clip(raw, -clip, clip))
+        return e / e.sum(axis=1, keepdims=True)
+
+    eqs = []
+    for k in _classes_to_fit:
+        m = PYSR_MODELS[k]
+        eqs.append({"lhs": (f"logit P({TARGET_COL} = {CLASSES[k]})" if PYSR_TARGET == "logit"
+                            else f"margin for {TARGET_COL} = {CLASSES[k]}"),
+                    "equation": str(m.get_best()["equation"]),
+                    "latex": m.latex(precision=4),
+                    "front": m.equations_[["complexity", "loss", "equation"]].copy(),
+                    "renamed": dict(pysr_renamed)})
+    return pysr_proba, eqs
+
+
+def export_gui_bundle(path=None, specs=None):
+    """Write every fitted model and its context to one file the GUI can load."""
+    try:
+        import cloudpickle
+    except ImportError:
+        print("cloudpickle is needed for the GUI export:  pip install cloudpickle")
+        return None
+    import datetime
+    path = GUI_BUNDLE_PATH if path is None else path
+    specs = all_models if specs is None else specs
+
+    # Raw form inputs if the replay is exact; the encoded columns if it is not.
+    raw_tr, raw_te = X_raw.loc[x_train.index], X_raw.loc[x_test.index]
+    enc = GuiRawEncoder(X_raw, X)
+    replay = enc(X_raw)
+    exact = replay.shape == X.shape and np.allclose(
+        replay, np.asarray(X, dtype=np.float32), atol=1e-5, equal_nan=True)
+    if exact:
+        features = enc.raw_cols
+        X_train_g, X_test_g = (raw_tr[features].reset_index(drop=True),
+                               raw_te[features].reset_index(drop=True))
+        encode = enc
+        print(f"  raw-input replay of encode_features verified on all {len(X_raw):,} rows")
+    else:
+        features = list(x_train.columns)
+        X_train_g, X_test_g = x_train.reset_index(drop=True), x_test.reset_index(drop=True)
+
+        def encode(df, _cols=tuple(features)):
+            return np.asarray(df[list(_cols)], dtype=np.float32)
+        print("  NOTE: the raw-input replay did not reproduce the encoded matrix exactly; "
+              "the GUI will ask for the encoded columns instead.")
+
+    models, test_pred, train_pred = {}, {}, {}
+    cv_score, params, fit_time, skipped = {}, {}, {}, []
+    same_units = PRIMARY_METRIC == "ROC_AUC"     # the GUI ranks and labels in ROC-AUC
+    for spec in specs:
+        if spec.proba_fn is None:
+            skipped.append((spec.name, "not fitted"))
+            continue
+        try:
+            cloudpickle.dumps(spec.proba_fn)
+        except Exception as exc:
+            skipped.append((spec.name, f"{type(exc).__name__}: {exc}"))
+            continue
+        models[spec.name] = spec.proba_fn
+        test_pred[spec.name] = spec.predict_proba(X_te)
+        train_pred[spec.name] = spec.predict_proba(X_tr)
+        cv_score[spec.name] = (float(spec.cv_score) if same_units and spec.cv_score is not None
+                               else None)
+        params[spec.name] = dict(spec.best_params or {})
+        fit_time[spec.name] = spec.fit_time_s
+
+    extras = {}
+    try:
+        f, eqs = _pysr_as_numpy()
+        if f is not None:
+            models["PySR (symbolic)"] = f
+            test_pred["PySR (symbolic)"] = f(X_te)
+            train_pred["PySR (symbolic)"] = f(X_tr)
+            cv_score["PySR (symbolic)"], params["PySR (symbolic)"] = None, {}
+            fit_time["PySR (symbolic)"] = None
+            extras["pysr"] = eqs
+    except Exception as exc:
+        print(f"  PySR rule not exported: {type(exc).__name__}: {exc}")
+
+    if not models:
+        print("No model could be exported.")
+        return None
+    best = best_spec.name if best_spec.name in models else max(
+        models, key=lambda n: RESULTS.get(n, {}).get("ROC_AUC", -np.inf))
+    bundle = {
+        "format": "ml-gui-bundle/1",
+        "task": "classification",
+        "source": "Notebook: classification_models_tuned",
+        "target": TARGET_COL,
+        "features": list(features),
+        "feature_info": _gui_feature_info(X_train_g),
+        "encode": encode,
+        "models": models,
+        "classes": [str(c) for c in CLASSES], "positive_index": int(POS_LABEL),
+        "X_train": X_train_g, "X_test": X_test_g,
+        "y_train": np.asarray(y_tr, dtype=np.int64), "y_test": np.asarray(y_te, dtype=np.int64),
+        "test_pred": test_pred, "train_pred": train_pred,
+        "cv_score": cv_score, "params": params, "fit_time": fit_time,
+        "primary_metric": "ROC_AUC", "rank_by": "test",
+        "best_model": best,
+        "selection_note": "highest test ROC-AUC — the same choice as the notebook's best_spec",
+        "refit": {}, "failures": dict(skipped), "skipped": [],
+        "settings": {"split seed": BEST_SEED, "test size": TEST_SIZE,
+                     "resampling": RESAMPLING, "raw inputs": bool(exact)},
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "extras": extras,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as fh:
+        cloudpickle.dump(bundle, fh)
+    print(f"\nGUI bundle written: {path}  ({os.path.getsize(path) / 1e6:.1f} MB, "
+          f"{len(models)} models, best = {best})")
+    for name, why in skipped:
+        print(f"  left out {name}: {why}")
+    print("  Open it with:  streamlit run gui/app.py  ->  Load trained models (.pkl)")
+    return path
+
+
+export_gui_bundle()
+
+
 print(f"\n{len(SAVED_FIGURES)} figure(s) written under {FIGURE_DIR}/")
 _by_dir = {}
 for _path in SAVED_FIGURES:
